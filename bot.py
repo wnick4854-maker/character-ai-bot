@@ -61,7 +61,6 @@ def init_db():
             active_persona_id INTEGER
         )
     """)
-    # Таблица для хранения нескольких персон пользователя
     c.execute("""
         CREATE TABLE IF NOT EXISTS user_personas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -168,6 +167,10 @@ class CreatePersona(StatesGroup):
     text = State()
 
 
+class EditPersona(StatesGroup):
+    text = State()
+
+
 # --- КЛАВИАТУРЫ ---
 def main_menu_kb():
     return ReplyKeyboardMarkup(
@@ -211,7 +214,7 @@ def get_personas_kb(user_id: int):
 
     buttons = []
     for persona_id, name in personas:
-        buttons.append([InlineKeyboardButton(text=f"👤 {name}", callback_data=f"selectpersona_{persona_id}")])
+        buttons.append([InlineKeyboardButton(text=f"👤 {name}", callback_data=f"viewpersona_{persona_id}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -386,7 +389,7 @@ async def generate_ai_reply(system_prompt: str, history: list, current_score: in
 async def cmd_start(message: types.Message):
     await message.answer(
         "👋 **Добро пожаловать в личный Character.AI!**\n\n"
-        "Выбирай персонажа, настраивай **свои персоны** и общайся в ролевом режиме с полным погружением!",
+        "Выбирай персонажа, управляй своими **персонами** (создавай, редактируй, удаляй) и общайся с погружением!",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
     )
@@ -406,7 +409,36 @@ async def show_personas(message: types.Message):
     if not kb.inline_keyboard:
         await message.answer("У вас пока нет созданных персон. Нажмите «➕ Создать персону» в меню!", reply_markup=main_menu_kb())
         return
-    await message.answer("Выберите активную персону (роль, за которую будете играть):", reply_markup=kb)
+    await message.answer("Выберите персону для просмотра, редактирования или выбора:", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("viewpersona_"))
+async def view_persona_callback(callback: types.CallbackQuery):
+    persona_id = int(callback.data.split("_")[1])
+    conn = sqlite3.connect("characters.db")
+    c = conn.cursor()
+    c.execute("SELECT name, profile_text FROM user_personas WHERE id = ?", (persona_id,))
+    row = c.fetchone()
+    conn.close()
+
+    if not row:
+        await callback.answer("Персона не найдена.")
+        return
+
+    name, text = row
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Выбрать эту", callback_data=f"selectpersona_{persona_id}")],
+            [InlineKeyboardButton(text="✏️ Изменить описание", callback_data=f"editpersona_{persona_id}")],
+            [InlineKeyboardButton(text="🗑 Удалить персону", callback_data=f"delpersona_{persona_id}")]
+        ]
+    )
+    await callback.message.edit_text(
+        f"👤 **Персона: {name}**\n\n{text}",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("selectpersona_"))
@@ -432,17 +464,59 @@ async def select_persona_callback(callback: types.CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data.startswith("editpersona_"))
+async def edit_persona_start(callback: types.CallbackQuery, state: FSMContext):
+    persona_id = int(callback.data.split("_")[1])
+    await state.update_data(edit_persona_id=persona_id)
+    await state.set_state(EditPersona.text)
+    await callback.message.answer("✏️ Отправьте новый текст описания для этой персоны:", parse_mode="Markdown")
+    await callback.answer()
+
+
+@dp.message(EditPersona.text)
+async def edit_persona_save(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    persona_id = data["edit_persona_id"]
+    new_text = message.text.strip()
+
+    conn = sqlite3.connect("characters.db")
+    c = conn.cursor()
+    c.execute("UPDATE user_personas SET profile_text = ? WHERE id = ?", (persona_id, new_text))
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+    await message.answer("✅ **Описание персоны успешно обновлено!**", reply_markup=main_menu_kb(), parse_mode="Markdown")
+
+
+@dp.callback_query(F.data.startswith("delpersona_"))
+async def delete_persona_callback(callback: types.CallbackQuery):
+    persona_id = int(callback.data.split("_")[1])
+    user_id = callback.from_user.id
+
+    conn = sqlite3.connect("characters.db")
+    c = conn.cursor()
+    c.execute("DELETE FROM user_personas WHERE id = ? AND user_id = ?", (persona_id, user_id))
+    # Если удаленная персона была активной, сбрасываем у юзера
+    c.execute("UPDATE users SET active_persona_id = NULL WHERE user_id = ? AND active_persona_id = ?", (user_id, persona_id))
+    conn.commit()
+    conn.close()
+
+    await callback.message.edit_text("🗑 Персона успешно удалена.", parse_mode="Markdown")
+    await callback.answer()
+
+
 @dp.message(F.text == "➕ Создать персону")
 async def start_create_persona(message: types.Message, state: FSMContext):
     await state.set_state(CreatePersona.name)
-    await message.answer("✏️ **Шаг 1 из 2:** Введите имя или название для вашей персоны (например, `Детектив Джон` или `Эльфийка Мира`):", parse_mode="Markdown")
+    await message.answer("✏️ **Шаг 1 из 2:** Введите имя или название для вашей персоны (например, `Детектив Джон`):", parse_mode="Markdown")
 
 
 @dp.message(CreatePersona.name)
 async def process_persona_name(message: types.Message, state: FSMContext):
     await state.update_data(name=message.text.strip())
     await state.set_state(CreatePersona.text)
-    await message.answer("🧠 **Шаг 2 из 2:** Опишите вашу персону (возраст, внешность, характер, оружие или предысторию):", parse_mode="Markdown")
+    await message.answer("🧠 **Шаг 2 из 2:** Опишите вашу персону (возраст, внешность, характер или предысторию):", parse_mode="Markdown")
 
 
 @dp.message(CreatePersona.text)
@@ -456,7 +530,6 @@ async def process_persona_text(message: types.Message, state: FSMContext):
     c = conn.cursor()
     c.execute("INSERT INTO user_personas (user_id, name, profile_text) VALUES (?, ?, ?)", (user_id, persona_name, profile_text))
     persona_id = c.lastrowid
-    # Сделать её автоматически активной
     c.execute("INSERT OR IGNORE INTO users (user_id, active_persona_id) VALUES (?, ?)", (user_id, persona_id))
     c.execute("UPDATE users SET active_persona_id = ? WHERE user_id = ?", (persona_id, user_id))
     conn.commit()
