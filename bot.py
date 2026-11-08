@@ -99,50 +99,121 @@ def init_db():
     conn = DBConnection()
     c = conn.cursor()
     
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS characters (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            name TEXT,
-            prompt TEXT,
-            greeting TEXT,
-            avatar_url TEXT DEFAULT ''
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            active_char_id INTEGER,
-            active_persona_id INTEGER
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS user_personas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            name TEXT,
-            profile_text TEXT,
-            avatar_url TEXT DEFAULT ''
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            char_id INTEGER,
-            role TEXT,
-            content TEXT,
-            delta INTEGER DEFAULT 0
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS relationships (
-            user_id INTEGER,
-            char_id INTEGER,
-            affection INTEGER DEFAULT 20,
-            PRIMARY KEY (user_id, char_id)
-        )
-    """)
+    # Проверяем, работаем ли мы с PostgreSQL
+    is_pg = conn.is_pg
+
+    if is_pg:
+        # Запросы для PostgreSQL (используем SERIAL PRIMARY KEY)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS characters (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER,
+                name TEXT,
+                prompt TEXT,
+                greeting TEXT,
+                avatar_url TEXT DEFAULT ''
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                active_char_id INTEGER,
+                active_persona_id INTEGER
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS user_personas (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER,
+                name TEXT,
+                profile_text TEXT,
+                avatar_url TEXT DEFAULT ''
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER,
+                char_id INTEGER,
+                role TEXT,
+                content TEXT,
+                delta INTEGER DEFAULT 0
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS relationships (
+                user_id INTEGER,
+                char_id INTEGER,
+                affection INTEGER DEFAULT 20,
+                PRIMARY KEY (user_id, char_id)
+            )
+        """)
+    else:
+        # Запросы для локального SQLite (используем AUTOINCREMENT)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS characters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                name TEXT,
+                prompt TEXT,
+                greeting TEXT,
+                avatar_url TEXT DEFAULT ''
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                active_char_id INTEGER,
+                active_persona_id INTEGER
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS user_personas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                name TEXT,
+                profile_text TEXT,
+                avatar_url TEXT DEFAULT ''
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                char_id INTEGER,
+                role TEXT,
+                content TEXT,
+                delta INTEGER DEFAULT 0
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS relationships (
+                user_id INTEGER,
+                char_id INTEGER,
+                affection INTEGER DEFAULT 20,
+                PRIMARY KEY (user_id, char_id)
+            )
+        """)
+
+        # PRAGMA проверки нужны только для SQLite
+        c.execute("PRAGMA table_info(characters)")
+        columns = [col[1] for col in c.fetchall()]
+        if "avatar_url" not in columns:
+            c.execute("ALTER TABLE characters ADD COLUMN avatar_url TEXT DEFAULT ''")
+
+        c.execute("PRAGMA table_info(user_personas)")
+        p_columns = [col[1] for col in c.fetchall()]
+        if "avatar_url" not in p_columns:
+            c.execute("ALTER TABLE user_personas ADD COLUMN avatar_url TEXT DEFAULT ''")
+
+        c.execute("PRAGMA table_info(users)")
+        u_columns = [col[1] for col in c.fetchall()]
+        if "active_persona_id" not in u_columns:
+            c.execute("ALTER TABLE users ADD COLUMN active_persona_id INTEGER")
+
+    conn.commit()
+    conn.close()
+    print("База данных успешно инициализирована!")
 
     # Выполняем PRAGMA проверки ТОЛЬКО для SQLite. 
     # Благодаря этому PostgreSQL не будет падать с ошибкой закрытого курсора.
