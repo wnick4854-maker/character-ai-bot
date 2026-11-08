@@ -16,8 +16,8 @@ from aiogram.types import (
 from openai import AsyncOpenAI
 
 # ================= НАСТРОЙКИ =================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "ВАШ_ТОКЕН_ОТ_BOTFATHER")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "ВАШ_КЛЮЧ_ОТ_OPENROUTER")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 FREE_MODELS = [
     "google/gemma-3-27b-it:free",
