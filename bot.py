@@ -48,11 +48,11 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 class DBConnection:
     def __init__(self):
-        self.is_pg = bool(DATABASE_URL)
+        self.is_pg = bool(DATABASE_URL and DATABASE_URL.strip())
         if self.is_pg:
-            self.conn = psycopg2.connect(DATABASE_URL)
+            self.conn = psycopg2.connect(DATABASE_URL.strip())
         else:
-            self.conn = DBConnection()
+            self.conn = sqlite3.connect("characters.db")
 
     def cursor(self):
         return DBCursor(self.conn.cursor(), self.is_pg)
@@ -72,7 +72,6 @@ class DBCursor:
         if self.is_pg:
             query = query.replace("?", "%s")
             query = query.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
-            query = query.replace("INSERT OR REPLACE INTO users (user_id, active_char_id)", "INSERT INTO users (user_id, active_char_id)")
             if "INSERT INTO users" in query and "ON CONFLICT" not in query:
                 query += " ON CONFLICT (user_id) DO UPDATE SET active_char_id = EXCLUDED.active_char_id"
         if params is not None:
@@ -88,9 +87,77 @@ class DBCursor:
     @property
     def lastrowid(self):
         return getattr(self.cursor, "lastrowid", None)
+
+
 def init_db():
     conn = DBConnection()
     c = conn.cursor()
+    
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS characters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            name TEXT,
+            prompt TEXT,
+            greeting TEXT,
+            avatar_url TEXT DEFAULT ''
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            active_char_id INTEGER,
+            active_persona_id INTEGER
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS user_personas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            name TEXT,
+            profile_text TEXT,
+            avatar_url TEXT DEFAULT ''
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            char_id INTEGER,
+            role TEXT,
+            content TEXT,
+            delta INTEGER DEFAULT 0
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS relationships (
+            user_id INTEGER,
+            char_id INTEGER,
+            affection INTEGER DEFAULT 20,
+            PRIMARY KEY (user_id, char_id)
+        )
+    """)
+
+    # Выполняем PRAGMA проверки ТОЛЬКО для SQLite. 
+    # Благодаря этому PostgreSQL не будет падать с ошибкой закрытого курсора.
+    if not conn.is_pg:
+        c.execute("PRAGMA table_info(characters)")
+        columns = [col[1] for col in c.fetchall()]
+        if "avatar_url" not in columns:
+            c.execute("ALTER TABLE characters ADD COLUMN avatar_url TEXT DEFAULT ''")
+
+        c.execute("PRAGMA table_info(user_personas)")
+        p_columns = [col[1] for col in c.fetchall()]
+        if "avatar_url" not in p_columns:
+            c.execute("ALTER TABLE user_personas ADD COLUMN avatar_url TEXT DEFAULT ''")
+
+        c.execute("PRAGMA table_info(users)")
+        u_columns = [col[1] for col in c.fetchall()]
+        if "active_persona_id" not in u_columns:
+            c.execute("ALTER TABLE users ADD COLUMN active_persona_id INTEGER")
+
+    conn.commit()
+    conn.close()
     
     # Создаем таблицы (они универсальны для SQLite и PostgreSQL)
     c.execute("""
