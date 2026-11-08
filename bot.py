@@ -751,7 +751,58 @@ async def reset_chat(message: types.Message):
     save_message(user_id, char_id, "assistant", greeting, delta=0)
     footer = format_affection_footer(DEFAULT_AFFECTION, 0, "С чистого листа")
     await message.answer(f"🔄 Диалог с **{name}** сброшен!\n\n{greeting}{footer}", parse_mode="Markdown")
+@dp.message(F.text == "🗑 Удалить текущего")
+async def delete_current_char(message: types.Message):
+    user_id = message.from_user.id
+    char = get_active_character(user_id)
+    if not char:
+        await message.answer("Персонаж не выбран.")
+        return
+    char_id, name, _, _, _, owner_id = char
+    if owner_id == 0:
+        await message.answer("Стандартных персонажей удалять нельзя.")
+        return
 
+    conn = sqlite3.connect("characters.db")
+    c = conn.cursor()
+    c.execute("DELETE FROM characters WHERE id = ? AND user_id = ?", (char_id, user_id))
+    c.execute("DELETE FROM messages WHERE char_id = ? AND user_id = ?", (char_id, user_id))
+    c.execute("DELETE FROM relationships WHERE char_id = ? AND user_id = ?", (char_id, user_id))
+    c.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    await message.answer(f"🗑 Персонаж **{name}** удален.", parse_mode="Markdown")
+
+
+# --- ОСНОВНОЙ ЧАТ ---
+@dp.message()
+async def chat_handler(message: types.Message):
+    if not message.text:
+        return
+
+    user_id = message.from_user.id
+    char = get_active_character(user_id)
+    if not char:
+        await message.answer("Сначала выберите персонажа из меню!", reply_markup=get_characters_kb(user_id))
+        return
+
+    char_id, name, prompt, _, _, _ = char
+    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+
+    save_message(user_id, char_id, "user", message.text, delta=0)
+    current_score = get_affection(user_id, char_id)
+    history = get_chat_history(user_id, char_id)
+    user_profile = get_active_persona_text(user_id)
+
+    clean_reply, mood, delta = await generate_ai_reply(prompt, history, current_score, user_profile)
+    new_score = update_affection(user_id, char_id, delta)
+    save_message(user_id, char_id, "assistant", clean_reply, delta=delta)
+
+    full_text = f"{clean_reply}{format_affection_footer(new_score, delta, mood)}"
+    try:
+        await message.answer(full_text, reply_markup=regen_kb(), parse_mode="Markdown")
+    except Exception:
+        await message.answer(full_text, reply_markup=regen_kb())
 # --- МИНИ-СЕРВЕР ДЛЯ RENDER ---
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
