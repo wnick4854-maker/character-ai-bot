@@ -478,4 +478,48 @@ def clear_history(user_id: int, char_id: int):
 async def generate_ai_reply(system_prompt: str, history: list, current_score: int, user_profile: str) -> tuple[str, str, int]:
     status_title, behavior_guide = get_relationship_status(current_score)
 
-    system_instruction = (
+    system_instruction = "Персонаж и его правила:\n" + system_prompt + "\n\nИнформация об игроке:\n" + user_profile + "\n\nУровень связи: " + str(current_score) + "/100 (" + status_title + "). " + behavior_guide + "\n\nПравила:\n1. Пиши на русском языке, без латиницы и иностранных слов.\n2. Отвечай от первого лица, действия пиши в *звездочках*.\n3. В конце ответа укажи настроение и дельту в формате:\n[MOOD: спокойный интерес | DELTA: +2]"
+    
+    messages = [{"role": "system", "content": system_instruction}] + history
+
+    raw_reply = None
+    last_error = None
+    for model_name in FREE_MODELS:
+        try:
+            if "gemma" in model_name.lower() and history:
+                req_messages = [{"role": "user", "content": "СИСТЕМНАЯ ИНСТРУКЦИЯ:\n" + system_instruction}] + history
+            else:
+                req_messages = messages
+
+            response = await client.chat.completions.create(
+                model=model_name,
+                messages=req_messages,
+                temperature=0.7,
+                max_tokens=650,
+            )
+            if response.choices and response.choices[0].message.content:
+                raw_reply = response.choices[0].message.content.strip()
+                break
+        except Exception as e:
+            last_error = e
+            continue
+
+    if not raw_reply:
+        return f"⚠️ Серверы перегружены. Повторите попытку. ({last_error})", "Ожидание", 0
+
+    mood = "Нейтральное"
+    delta = 0
+    pattern = r"\[MOOD:\s*(.+?)\s*\|\s*DELTA:\s*([+-]?\d+)\s*\]"
+    match = re.search(pattern, raw_reply, re.IGNORECASE)
+    if match:
+        mood = match.group(1).strip()
+        try:
+            delta = int(match.group(2))
+            delta = max(-5, min(5, delta))
+        except ValueError:
+            delta = 0
+        clean_reply = re.sub(pattern, "", raw_reply, flags=re.IGNORECASE).strip()
+    else:
+        clean_reply = raw_reply
+
+    return clean_reply, mood, delta
