@@ -737,4 +737,33 @@ async def reset_chat(message: types.Message):
     user_id = message.from_user.id
     char = get_active_character(user_id)
     if not char:
-        await message.
+        await message.answer("Сначала выберите персонажа!")
+        return
+    char_id, name, _, greeting, _, _ = char
+    clear_history(user_id, char_id)
+    save_message(user_id, char_id, "assistant", greeting, delta=0)
+    footer = format_affection_footer(DEFAULT_AFFECTION, 0, "С чистого листа")
+    await message.answer(f"🔄 Диалог с **{name}** сброшен!\n\n{greeting}{footer}", parse_mode="Markdown")
+
+# --- МИНИ-СЕРВЕР ДЛЯ RENDER ---
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is alive!")
+
+def run_web_server():
+    port = int(os.getenv("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), SimpleHandler)
+    server.serve_forever()
+
+
+async def main():
+    init_db()
+    print("Бот успешно запущен!")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    threading.Thread(target=run_web_server, daemon=True).start()
+    asyncio.run(main())
