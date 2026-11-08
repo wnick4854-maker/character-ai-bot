@@ -1,3 +1,4 @@
+import psycopg2
 import asyncio
 import sqlite3
 import logging
@@ -43,12 +44,58 @@ dp = Dispatcher()
 
 
 # --- БАЗА ДАННЫХ (SQLite) ---
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+class DBConnection:
+    def __init__(self):
+        self.is_pg = bool(DATABASE_URL)
+        if self.is_pg:
+            self.conn = psycopg2.connect(DATABASE_URL)
+        else:
+            self.conn = DBConnection()
+
+    def cursor(self):
+        return DBCursor(self.conn.cursor(), self.is_pg)
+
+    def commit(self):
+        self.conn.commit()
+
+    def close(self):
+        self.conn.close()
+
+class DBCursor:
+    def __init__(self, cursor, is_pg):
+        self.cursor = cursor
+        self.is_pg = is_pg
+
+    def execute(self, query, params=None):
+        if self.is_pg:
+            query = query.replace("?", "%s")
+            query = query.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+            query = query.replace("INSERT OR REPLACE INTO users (user_id, active_char_id)", "INSERT INTO users (user_id, active_char_id)")
+            if "INSERT INTO users" in query and "ON CONFLICT" not in query:
+                query += " ON CONFLICT (user_id) DO UPDATE SET active_char_id = EXCLUDED.active_char_id"
+        if params is not None:
+            return self.cursor.execute(query, params)
+        return self.cursor.execute(query)
+
+    def fetchone(self):
+        return self.cursor.fetchone()
+
+    def fetchall(self):
+        return self.cursor.fetchall()
+
+    @property
+    def lastrowid(self):
+        return getattr(self.cursor, "lastrowid", None)
 def init_db():
-    conn = sqlite3.connect("characters.db")
+    conn = DBConnection()
     c = conn.cursor()
+    
+    # Создаем таблицы (они универсальны для SQLite и PostgreSQL)
     c.execute("""
         CREATE TABLE IF NOT EXISTS characters (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             user_id INTEGER,
             name TEXT,
             prompt TEXT,
@@ -65,7 +112,7 @@ def init_db():
     """)
     c.execute("""
         CREATE TABLE IF NOT EXISTS user_personas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             user_id INTEGER,
             name TEXT,
             profile_text TEXT,
@@ -74,7 +121,7 @@ def init_db():
     """)
     c.execute("""
         CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             user_id INTEGER,
             char_id INTEGER,
             role TEXT,
@@ -86,10 +133,31 @@ def init_db():
         CREATE TABLE IF NOT EXISTS relationships (
             user_id INTEGER,
             char_id INTEGER,
-            score INTEGER DEFAULT 20,
+            affection INTEGER DEFAULT 20,
             PRIMARY KEY (user_id, char_id)
         )
     """)
+
+    # ПРОВЕРКИ PRAGMA НУЖНЫ ТОЛЬКО ДЛЯ SQLite! 
+    # Обворачиваем их в блок if not DATABASE_URL:, чтобы PostgreSQL их даже не пытался читать
+    if not DATABASE_URL:
+        c.execute("PRAGMA table_info(characters)")
+        columns = [col[1] for col in c.fetchall()]
+        if "avatar_url" not in columns:
+            c.execute("ALTER TABLE characters ADD COLUMN avatar_url TEXT DEFAULT ''")
+
+        c.execute("PRAGMA table_info(user_personas)")
+        p_columns = [col[1] for col in c.fetchall()]
+        if "avatar_url" not in p_columns:
+            c.execute("ALTER TABLE user_personas ADD COLUMN avatar_url TEXT DEFAULT ''")
+
+        c.execute("PRAGMA table_info(users)")
+        u_columns = [col[1] for col in c.fetchall()]
+        if "active_persona_id" not in u_columns:
+            c.execute("ALTER TABLE users ADD COLUMN active_persona_id INTEGER")
+
+    conn.commit()
+    conn.close()
 
     # Проверяем колонку аватара у персон (на случай обновления старой базы)
     c.execute("PRAGMA table_info(user_personas)")
@@ -198,7 +266,7 @@ def regen_kb():
 
 
 def get_characters_kb(user_id: int):
-    conn = sqlite3.connect("characters.db")
+    conn = DBConnection()
     c = conn.cursor()
     c.execute("SELECT id, name, user_id FROM characters WHERE user_id IN (0, ?)", (user_id,))
     chars = c.fetchall()
@@ -212,7 +280,7 @@ def get_characters_kb(user_id: int):
 
 
 def get_personas_kb(user_id: int):
-    conn = sqlite3.connect("characters.db")
+    conn = DBConnection()
     c = conn.cursor()
     c.execute("SELECT id, name FROM user_personas WHERE user_id = ?", (user_id,))
     personas = c.fetchall()
@@ -226,7 +294,7 @@ def get_personas_kb(user_id: int):
 
 # --- РАБОТА С БД ---
 def get_active_persona_text(user_id: int) -> str:
-    conn = sqlite3.connect("characters.db")
+    conn = DBConnection()
     c = conn.cursor()
     c.execute("SELECT active_persona_id FROM users WHERE user_id = ?", (user_id,))
     row = c.fetchone()
@@ -244,7 +312,7 @@ def get_active_persona_text(user_id: int) -> str:
 
 
 def set_active_character(user_id: int, char_id: int):
-    conn = sqlite3.connect("characters.db")
+    conn = DBConnection()
     c = conn.cursor()
     c.execute("SELECT active_persona_id FROM users WHERE user_id = ?", (user_id,))
     row = c.fetchone()
@@ -257,7 +325,7 @@ def set_active_character(user_id: int, char_id: int):
 
 
 def get_active_character(user_id: int):
-    conn = sqlite3.connect("characters.db")
+    conn = DBConnection()
     c = conn.cursor()
     c.execute("""
         SELECT c.id, c.name, c.prompt, c.greeting, c.avatar_url, c.user_id
@@ -271,7 +339,7 @@ def get_active_character(user_id: int):
 
 
 def get_affection(user_id: int, char_id: int) -> int:
-    conn = sqlite3.connect("characters.db")
+    conn = DBConnection()
     c = conn.cursor()
     c.execute("SELECT score FROM relationships WHERE user_id = ? AND char_id = ?", (user_id, char_id))
     row = c.fetchone()
@@ -282,7 +350,7 @@ def get_affection(user_id: int, char_id: int) -> int:
 def update_affection(user_id: int, char_id: int, delta: int) -> int:
     current = get_affection(user_id, char_id)
     new_score = max(0, min(100, current + delta))
-    conn = sqlite3.connect("characters.db")
+    conn = DBConnection()
     c = conn.cursor()
     c.execute("INSERT OR REPLACE INTO relationships (user_id, char_id, score) VALUES (?, ?, ?)", (user_id, char_id, new_score))
     conn.commit()
@@ -291,7 +359,7 @@ def update_affection(user_id: int, char_id: int, delta: int) -> int:
 
 
 def save_message(user_id: int, char_id: int, role: str, content: str, delta: int = 0):
-    conn = sqlite3.connect("characters.db")
+    conn = DBConnection()
     c = conn.cursor()
     c.execute("INSERT INTO messages (user_id, char_id, role, content, delta) VALUES (?, ?, ?, ?, ?)", (user_id, char_id, role, content, delta))
     conn.commit()
@@ -299,7 +367,7 @@ def save_message(user_id: int, char_id: int, role: str, content: str, delta: int
 
 
 def get_chat_history(user_id: int, char_id: int):
-    conn = sqlite3.connect("characters.db")
+    conn = DBConnection()
     c = conn.cursor()
     c.execute("SELECT role, content FROM messages WHERE user_id = ? AND char_id = ? ORDER BY id DESC LIMIT ?", (user_id, char_id, MAX_HISTORY_MESSAGES))
     rows = c.fetchall()
@@ -308,7 +376,7 @@ def get_chat_history(user_id: int, char_id: int):
 
 
 def delete_last_assistant_message(user_id: int, char_id: int) -> bool:
-    conn = sqlite3.connect("characters.db")
+    conn = DBConnection()
     c = conn.cursor()
     c.execute("SELECT id, role, delta FROM messages WHERE user_id = ? AND char_id = ? ORDER BY id DESC LIMIT 2", (user_id, char_id))
     rows = c.fetchall()
@@ -325,7 +393,7 @@ def delete_last_assistant_message(user_id: int, char_id: int) -> bool:
 
 
 def clear_history(user_id: int, char_id: int):
-    conn = sqlite3.connect("characters.db")
+    conn = DBConnection()
     c = conn.cursor()
     c.execute("DELETE FROM messages WHERE user_id = ? AND char_id = ?", (user_id, char_id))
     c.execute("INSERT OR REPLACE INTO relationships (user_id, char_id, score) VALUES (?, ?, ?)", (user_id, char_id, DEFAULT_AFFECTION))
@@ -426,7 +494,7 @@ async def show_personas(message: types.Message):
 @dp.callback_query(F.data.startswith("viewpersona_"))
 async def view_persona_callback(callback: types.CallbackQuery):
     persona_id = int(callback.data.split("_")[1])
-    conn = sqlite3.connect("characters.db")
+    conn = DBConnection()
     c = conn.cursor()
     c.execute("SELECT name, profile_text, avatar_url FROM user_personas WHERE id = ?", (persona_id,))
     row = c.fetchone()
@@ -471,7 +539,7 @@ async def select_persona_callback(callback: types.CallbackQuery):
     persona_id = int(callback.data.split("_")[1])
     user_id = callback.from_user.id
 
-    conn = sqlite3.connect("characters.db")
+    conn = DBConnection()
     c = conn.cursor()
     c.execute("SELECT name FROM user_personas WHERE id = ?", (persona_id,))
     row = c.fetchone()
@@ -523,7 +591,7 @@ async def process_persona_avatar(message: types.Message, state: FSMContext):
         avatar_url = message.text.strip() # если вдруг скинули ссылку текстом
 
     user_id = message.from_user.id
-    conn = sqlite3.connect("characters.db")
+    conn = DBConnection()
     c = conn.cursor()
     c.execute("INSERT INTO user_personas (user_id, name, profile_text, avatar_url) VALUES (?, ?, ?, ?)", (user_id, persona_name, profile_text, avatar_url))
     persona_id = c.lastrowid
@@ -559,7 +627,7 @@ async def edit_persona_text_save(message: types.Message, state: FSMContext):
     persona_id = data["edit_persona_id"]
     new_text = message.text.strip()
 
-    conn = sqlite3.connect("characters.db")
+    conn = DBConnection()
     c = conn.cursor()
     c.execute("UPDATE user_personas SET profile_text = ? WHERE id = ?", (new_text, persona_id))
     conn.commit()
@@ -590,7 +658,7 @@ async def edit_persona_photo_save(message: types.Message, state: FSMContext):
     elif message.text and message.text.strip() not in ["-", "нет", "no"]:
         avatar_url = message.text.strip()
 
-    conn = sqlite3.connect("characters.db")
+    conn = DBConnection()
     c = conn.cursor()
     c.execute("UPDATE user_personas SET avatar_url = ? WHERE id = ?", (avatar_url, persona_id))
     conn.commit()
@@ -605,7 +673,7 @@ async def delete_persona_callback(callback: types.CallbackQuery):
     persona_id = int(callback.data.split("_")[1])
     user_id = callback.from_user.id
 
-    conn = sqlite3.connect("characters.db")
+    conn = DBConnection()
     c = conn.cursor()
     c.execute("DELETE FROM user_personas WHERE id = ? AND user_id = ?", (persona_id, user_id))
     c.execute("UPDATE users SET active_persona_id = NULL WHERE user_id = ? AND active_persona_id = ?", (user_id, persona_id))
@@ -658,7 +726,7 @@ async def process_char_avatar(message: types.Message, state: FSMContext):
         avatar_url = message.text.strip()
 
     user_id = message.from_user.id
-    conn = sqlite3.connect("characters.db")
+    conn = DBConnection()
     c = conn.cursor()
     c.execute(
         "INSERT INTO characters (user_id, name, prompt, greeting, avatar_url) VALUES (?, ?, ?, ?, ?)",
@@ -770,7 +838,7 @@ async def delete_current_char(message: types.Message):
         await message.answer("Стандартных персонажей удалять нельзя.")
         return
 
-    conn = sqlite3.connect("characters.db")
+    conn = DBConnection()
     c = conn.cursor()
     c.execute("DELETE FROM characters WHERE id = ? AND user_id = ?", (char_id, user_id))
     c.execute("DELETE FROM messages WHERE char_id = ? AND user_id = ?", (char_id, user_id))
