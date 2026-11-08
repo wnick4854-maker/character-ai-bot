@@ -579,6 +579,7 @@ async def edit_persona_photo_save(message: types.Message, state: FSMContext):
     
     avatar_url = ""
     if message.photo:
+        # Берем самое качественное фото из отправленных
         avatar_url = message.photo[-1].file_id
     elif message.text and message.text.strip() not in ["-", "нет", "no"]:
         avatar_url = message.text.strip()
@@ -590,7 +591,7 @@ async def edit_persona_photo_save(message: types.Message, state: FSMContext):
     conn.close()
 
     await state.clear()
-    await message.answer("✅ **Фото персоны успешно обновлено!**", reply_markup=main_menu_kb(), parse_mode="Markdown")
+    await message.answer("✅ **Фото персоны успешно обновлено!** Теперь при выборе этой персоны будет отображаться аватарка.", reply_markup=main_menu_kb(), parse_mode="Markdown")
 
 
 @dp.callback_query(F.data.startswith("delpersona_"))
