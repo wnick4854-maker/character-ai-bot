@@ -962,8 +962,10 @@ def run_web_server():
 
 
 async def main():
+    print("Инициализация базы данных...")
     init_db()
-    print("Бот успешно запущен!")
+    print("База данных успешно инициализирована!")
+    print("Запуск опроса Telegram (polling)...")
     await dp.start_polling(bot)
 
 
