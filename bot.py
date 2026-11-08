@@ -16,7 +16,7 @@ from aiogram.types import (
 from openai import AsyncOpenAI
 
 # ================= НАСТРОЙКИ =================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN",)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 FREE_MODELS = [
@@ -57,12 +57,16 @@ def init_db():
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
-            active_char_id INTEGER
+            active_char_id INTEGER,
+            active_persona_id INTEGER
         )
     """)
+    # Таблица для хранения нескольких персон пользователя
     c.execute("""
-        CREATE TABLE IF NOT EXISTS user_profiles (
-            user_id INTEGER PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS user_personas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            name TEXT,
             profile_text TEXT
         )
     """)
@@ -90,6 +94,7 @@ def init_db():
     if "avatar_url" not in columns:
         c.execute("ALTER TABLE characters ADD COLUMN avatar_url TEXT DEFAULT ''")
 
+    # Базовые персонажи
     c.execute("SELECT COUNT(*) FROM characters WHERE user_id = 0")
     if c.fetchone()[0] == 0:
         default_chars = [
@@ -158,7 +163,8 @@ class CreateChar(StatesGroup):
     avatar_url = State()
 
 
-class CreateProfile(StatesGroup):
+class CreatePersona(StatesGroup):
+    name = State()
     text = State()
 
 
@@ -167,8 +173,8 @@ def main_menu_kb():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🎭 Выбрать персонажа"), KeyboardButton(text="➕ Создать персонажа")],
-            [KeyboardButton(text="👤 Моя персона"), KeyboardButton(text="🔄 Сбросить диалог")],
-            [KeyboardButton(text="🗑 Удалить текущего")]
+            [KeyboardButton(text="👥 Мои персоны"), KeyboardButton(text="➕ Создать персону")],
+            [KeyboardButton(text="🔄 Сбросить диалог"), KeyboardButton(text="🗑 Удалить текущего")]
         ],
         resize_keyboard=True
     )
@@ -192,32 +198,50 @@ def get_characters_kb(user_id: int):
     buttons = []
     for char_id, name, owner_id in chars:
         label = f"{name} (Мой)" if owner_id != 0 else name
-        buttons.append([InlineKeyboardButton(text=label, callback_data=f"select_{char_id}")])
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"selectchar_{char_id}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-# --- РАБОТА С БД (ПЕРСОНА И ПРОФИЛЬ) ---
-def get_user_profile(user_id: int) -> str:
+def get_personas_kb(user_id: int):
     conn = sqlite3.connect("characters.db")
     c = conn.cursor()
-    c.execute("SELECT profile_text FROM user_profiles WHERE user_id = ?", (user_id,))
+    c.execute("SELECT id, name FROM user_personas WHERE user_id = ?", (user_id,))
+    personas = c.fetchall()
+    conn.close()
+
+    buttons = []
+    for persona_id, name in personas:
+        buttons.append([InlineKeyboardButton(text=f"👤 {name}", callback_data=f"selectpersona_{persona_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+# --- РАБОТА С БД (ПЕРСОНЫ И ПРОФИЛЬ) ---
+def get_active_persona_text(user_id: int) -> str:
+    conn = sqlite3.connect("characters.db")
+    c = conn.cursor()
+    c.execute("SELECT active_persona_id FROM users WHERE user_id = ?", (user_id,))
     row = c.fetchone()
+    if not row or not row[0]:
+        conn.close()
+        return "Игрок (без детального описания)"
+    
+    persona_id = row[0]
+    c.execute("SELECT name, profile_text FROM user_personas WHERE id = ?", (persona_id,))
+    p_row = c.fetchone()
     conn.close()
-    return row[0] if row else "Игрок (без детального описания)"
-
-
-def set_user_profile(user_id: int, text: str):
-    conn = sqlite3.connect("characters.db")
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO user_profiles (user_id, profile_text) VALUES (?, ?)", (user_id, text))
-    conn.commit()
-    conn.close()
+    if p_row:
+        return f"Имя/Роль: {p_row[0]}\nОписание: {p_row[1]}"
+    return "Игрок (без детального описания)"
 
 
 def set_active_character(user_id: int, char_id: int):
     conn = sqlite3.connect("characters.db")
     c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO users (user_id, active_char_id) VALUES (?, ?)", (user_id, char_id))
+    c.execute("SELECT active_persona_id FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    active_persona = row[0] if row else None
+
+    c.execute("INSERT OR REPLACE INTO users (user_id, active_char_id, active_persona_id) VALUES (?, ?, ?)", (user_id, char_id, active_persona))
     c.execute("INSERT OR IGNORE INTO relationships (user_id, char_id, score) VALUES (?, ?, ?)", (user_id, char_id, DEFAULT_AFFECTION))
     conn.commit()
     conn.close()
@@ -362,7 +386,7 @@ async def generate_ai_reply(system_prompt: str, history: list, current_score: in
 async def cmd_start(message: types.Message):
     await message.answer(
         "👋 **Добро пожаловать в личный Character.AI!**\n\n"
-        "Выбирай персонажа, заполни свою **Персону** (анкету игрока), чтобы герои знали твоё имя и внешность!",
+        "Выбирай персонажа, настраивай **свои персоны** и общайся в ролевом режиме с полным погружением!",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
     )
@@ -374,29 +398,75 @@ async def show_characters(message: types.Message):
     await message.answer("Выбери персонажа для общения:", reply_markup=get_characters_kb(message.from_user.id))
 
 
-# --- УПРАВЛЕНИЕ ПЕРСОНОЙ ---
-@dp.message(F.text == "👤 Моя персона")
-async def manage_profile(message: types.Message, state: FSMContext):
+# --- УПРАВЛЕНИЕ ПЕРСОНАМИ ---
+@dp.message(F.text == "👥 Мои персоны")
+async def show_personas(message: types.Message):
     user_id = message.from_user.id
-    current_profile = get_user_profile(user_id)
-    await state.set_state(CreateProfile.text)
-    await message.answer(
-        f"👤 **Ваша текущая персона:**\n\n{current_profile}\n\n"
-        "✏️ Отправьте новое описание для вашей персоны (ваше имя, возраст, внешность, стиль одежды или роль), чтобы персонажи учитывали это в диалогах:",
-        parse_mode="Markdown"
-    )
+    kb = get_personas_kb(user_id)
+    if not kb.inline_keyboard:
+        await message.answer("У вас пока нет созданных персон. Нажмите «➕ Создать персону» в меню!", reply_markup=main_menu_kb())
+        return
+    await message.answer("Выберите активную персону (роль, за которую будете играть):", reply_markup=kb)
 
 
-@dp.message(CreateProfile.text)
-async def save_profile_text(message: types.Message, state: FSMContext):
+@dp.callback_query(F.data.startswith("selectpersona_"))
+async def select_persona_callback(callback: types.CallbackQuery):
+    persona_id = int(callback.data.split("_")[1])
+    user_id = callback.from_user.id
+
+    conn = sqlite3.connect("characters.db")
+    c = conn.cursor()
+    c.execute("SELECT name FROM user_personas WHERE id = ?", (persona_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        await callback.answer("Персона не найдена.")
+        return
+    persona_name = row[0]
+
+    c.execute("UPDATE users SET active_persona_id = ? WHERE user_id = ?", (persona_id, user_id))
+    conn.commit()
+    conn.close()
+
+    await callback.message.answer(f"✅ Активная персона изменена на: **{persona_name}**", parse_mode="Markdown")
+    await callback.answer()
+
+
+@dp.message(F.text == "➕ Создать персону")
+async def start_create_persona(message: types.Message, state: FSMContext):
+    await state.set_state(CreatePersona.name)
+    await message.answer("✏️ **Шаг 1 из 2:** Введите имя или название для вашей персоны (например, `Детектив Джон` или `Эльфийка Мира`):", parse_mode="Markdown")
+
+
+@dp.message(CreatePersona.name)
+async def process_persona_name(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text.strip())
+    await state.set_state(CreatePersona.text)
+    await message.answer("🧠 **Шаг 2 из 2:** Опишите вашу персону (возраст, внешность, характер, оружие или предысторию):", parse_mode="Markdown")
+
+
+@dp.message(CreatePersona.text)
+async def process_persona_text(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    persona_name = data["name"]
+    profile_text = message.text.strip()
     user_id = message.from_user.id
-    new_profile = message.text.strip()
-    set_user_profile(user_id, new_profile)
+
+    conn = sqlite3.connect("characters.db")
+    c = conn.cursor()
+    c.execute("INSERT INTO user_personas (user_id, name, profile_text) VALUES (?, ?, ?)", (user_id, persona_name, profile_text))
+    persona_id = c.lastrowid
+    # Сделать её автоматически активной
+    c.execute("INSERT OR IGNORE INTO users (user_id, active_persona_id) VALUES (?, ?)", (user_id, persona_id))
+    c.execute("UPDATE users SET active_persona_id = ? WHERE user_id = ?", (persona_id, user_id))
+    conn.commit()
+    conn.close()
+
     await state.clear()
-    await message.answer("✅ **Ваша персона успешно обновлена!** Теперь все персонажи будут знать вас по этой анкете.", reply_markup=main_menu_kb(), parse_mode="Markdown")
+    await message.answer(f"🎉 Персона **{persona_name}** создана и установлена как активная!", reply_markup=main_menu_kb(), parse_mode="Markdown")
 
 
-@dp.callback_query(F.data.startswith("select_"))
+@dp.callback_query(F.data.startswith("selectchar_"))
 async def select_character_callback(callback: types.CallbackQuery):
     char_id = int(callback.data.split("_")[1])
     user_id = callback.from_user.id
@@ -446,7 +516,7 @@ async def regenerate_reply_callback(callback: types.CallbackQuery):
     await callback.answer("Генерирую новый вариант...")
     current_score = get_affection(user_id, char_id)
     history = get_chat_history(user_id, char_id)
-    user_profile = get_user_profile(user_id)
+    user_profile = get_active_persona_text(user_id)
 
     clean_reply, mood, delta = await generate_ai_reply(prompt, history, current_score, user_profile)
     new_score = update_affection(user_id, char_id, delta)
@@ -578,7 +648,7 @@ async def chat_handler(message: types.Message):
     save_message(user_id, char_id, "user", message.text, delta=0)
     current_score = get_affection(user_id, char_id)
     history = get_chat_history(user_id, char_id)
-    user_profile = get_user_profile(user_id)
+    user_profile = get_active_persona_text(user_id)
 
     clean_reply, mood, delta = await generate_ai_reply(prompt, history, current_score, user_profile)
     new_score = update_affection(user_id, char_id, delta)
