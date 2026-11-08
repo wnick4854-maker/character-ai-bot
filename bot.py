@@ -351,16 +351,14 @@ async def generate_ai_reply(system_prompt: str, history: list, current_score: in
         "и изменение связи от последней реплики игрока (целое число от -5 до +5) в формате:\n"
         "[MOOD: спокойный интерес | DELTA: +2]"
     )
-   messages = [{"role": "system", "content": system_instruction}] + history
+    messages = [{"role": "system", "content": system_instruction}] + history
 
     raw_reply = None
     last_error = None
     for model_name in FREE_MODELS:
         try:
-            # Для моделей Gemma объединяем системный промпт с первым сообщением, так как они не поддерживают роль system
             if "gemma" in model_name.lower() and history:
-                gemma_messages = [{"role": "user", "content": f"СИСТЕМНАЯ ИНСТРУКЦИЯ:\n{system_instruction}"}] + history
-                req_messages = gemma_messages
+                req_messages = [{"role": "user", "content": f"СИСТЕМНАЯ ИНСТРУКЦИЯ:\n{system_instruction}"}] + history
             else:
                 req_messages = messages
 
@@ -376,6 +374,26 @@ async def generate_ai_reply(system_prompt: str, history: list, current_score: in
         except Exception as e:
             last_error = e
             continue
+
+    if not raw_reply:
+        return f"⚠️ Серверы перегружены. Повторите попытку. ({last_error})", "Ожидание", 0
+
+    mood = "Нейтральное"
+    delta = 0
+    pattern = r"\[MOOD:\s*(.+?)\s*\|\s*DELTA:\s*([+-]?\d+)\s*\]"
+    match = re.search(pattern, raw_reply, re.IGNORECASE)
+    if match:
+        mood = match.group(1).strip()
+        try:
+            delta = int(match.group(2))
+            delta = max(-5, min(5, delta))
+        except ValueError:
+            delta = 0
+        clean_reply = re.sub(pattern, "", raw_reply, flags=re.IGNORECASE).strip()
+    else:
+        clean_reply = raw_reply
+
+    return clean_reply, mood, delta
 
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
