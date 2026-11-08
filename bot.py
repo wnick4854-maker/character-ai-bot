@@ -20,12 +20,11 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 FREE_MODELS = [
-    "openrouter/free",
     "deepseek/deepseek-chat-v3-0324:free",
-    "deepseek/deepseek-r1:free",
+    "google/gemma-3-27b-it:free",
     "qwen/qwen-2.5-72b-instruct:free",
     "mistralai/mistral-small-3.1-24b-instruct:free",
-    "google/gemma-3-27b-it:free"
+    "openrouter/free"
 ]
 
 MAX_HISTORY_MESSAGES = 20
@@ -344,9 +343,9 @@ async def generate_ai_reply(system_prompt: str, history: list, current_score: in
         f"Текущий уровень доверия/связи с собеседником: {current_score}/100 ({status_title}). "
         f"{behavior_guide}\n\n"
         "Правила ролевой игры:\n"
-        "1. Всегда оставайся в образе, отвечай на русском языке.\n"
-        "2. Используй *звездочки* для описания действий, мимики и окружения.\n"
-        "3. Никогда не упоминай, что ты ИИ.\n"
+        "1. Пиши ИСКЛЮЧИТЕЛЬНО на грамотном, живом русском языке. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО вставлять английские или иностранные слова латиницей.\n"
+        "2. Отвечай от первого лица в прямой речи, а действия описывай в *звездочках* (без кавычек вокруг реплик).\n"
+        "3. Не пересказывай анкету и внешность персонажа в каждом сообщении, реагируй естественно на реплику собеседника.\n"
         "4. ОБЯЗАТЕЛЬНО в самом конце ответа на новой строке укажи настроение (2-4 слова) "
         "и изменение связи от последней реплики игрока (целое число от -5 до +5) в формате:\n"
         "[MOOD: спокойный интерес | DELTA: +2]"
@@ -365,7 +364,7 @@ async def generate_ai_reply(system_prompt: str, history: list, current_score: in
             response = await client.chat.completions.create(
                 model=model_name,
                 messages=req_messages,
-                temperature=0.85,
+                temperature=0.7,
                 max_tokens=650,
             )
             if response.choices and response.choices[0].message.content:
