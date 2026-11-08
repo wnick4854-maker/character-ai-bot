@@ -13,8 +13,10 @@ from aiogram.types import (
 from openai import AsyncOpenAI
 
 # ================= НАСТРОЙКИ =================
-TELEGRAM_TOKEN = ""
-OPENROUTER_API_KEY = ""
+import os
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 # Бесплатные модели, хорошо подходящие для ролевой игры и романтики
 FREE_MODELS = [
