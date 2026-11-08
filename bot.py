@@ -21,9 +21,8 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 # Бесплатные ролевые модели
 FREE_MODELS = [
-    "nousresearch/hermes-3-llama-3.1-405b:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
     "google/gemma-3-27b-it:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
     "openrouter/free"
 ]
 
