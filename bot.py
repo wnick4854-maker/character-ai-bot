@@ -440,16 +440,23 @@ async def view_persona_callback(callback: types.CallbackQuery):
     )
     
     caption = f"👤 **Персона: {name}**\n\n{text}"
+    
+    # Удаляем старое сообщение с кнопками списка, чтобы не засорять чат
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+    # Если есть фото — отправляем фото с подписью, если нет — обычный текст
     if avatar:
         try:
             await callback.message.answer_photo(photo=avatar, caption=caption, reply_markup=kb, parse_mode="Markdown")
-            await callback.message.delete()
             await callback.answer()
             return
         except Exception:
             pass
-    
-    await callback.message.edit_text(caption, reply_markup=kb, parse_mode="Markdown")
+            
+    await callback.message.answer(caption, reply_markup=kb, parse_mode="Markdown")
     await callback.answer()
 
 
