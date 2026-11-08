@@ -7,7 +7,7 @@ import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -17,8 +17,9 @@ from aiogram.types import (
 from openai import AsyncOpenAI
 
 # ================= НАСТРОЙКИ =================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 FREE_MODELS = [
     "deepseek/deepseek-chat-v3-0324:free",
@@ -44,16 +45,15 @@ dp = Dispatcher()
 
 
 # --- БАЗА ДАННЫХ ---
-DATABASE_URL = os.getenv("DATABASE_URL")
-
 class DBConnection:
     def __init__(self):
-        self.is_pg = bool(DATABASE_URL and DATABASE_URL.strip())
+        clean_url = DATABASE_URL.strip().strip('"').strip("'")
+        self.is_pg = bool(clean_url)
         if self.is_pg:
-            self.conn = psycopg2.connect(DATABASE_URL.strip())
+            self.conn = psycopg2.connect(clean_url, connect_timeout=10)
             self.conn.autocommit = True
         else:
-            self.conn = sqlite3.connect("characters.db")
+            self.conn = sqlite3.connect("characters.db", timeout=10)
 
     def cursor(self):
         return self.conn.cursor()
@@ -63,14 +63,17 @@ class DBConnection:
             self.conn.commit()
 
     def close(self):
-        self.conn.close()
+        try:
+            self.conn.close()
+        except Exception:
+            pass
 
 
 def init_db():
     try:
         conn = DBConnection()
         c = conn.cursor()
-        
+
         if conn.is_pg:
             c.execute("""
                 CREATE TABLE IF NOT EXISTS characters (
@@ -116,6 +119,11 @@ def init_db():
                     PRIMARY KEY (user_id, char_id)
                 )
             """)
+            # Безопасная миграция для PostgreSQL (Neon Tech)
+            c.execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS avatar_url TEXT DEFAULT ''")
+            c.execute("ALTER TABLE user_personas ADD COLUMN IF NOT EXISTS avatar_url TEXT DEFAULT ''")
+            c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS active_persona_id INTEGER")
+            c.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS delta INTEGER DEFAULT 0")
         else:
             c.execute("""
                 CREATE TABLE IF NOT EXISTS characters (
@@ -162,7 +170,6 @@ def init_db():
                 )
             """)
 
-            # PRAGMA проверки нужны только для SQLite
             c.execute("PRAGMA table_info(characters)")
             columns = [col[1] for col in c.fetchall()]
             if "avatar_url" not in columns:
@@ -178,7 +185,6 @@ def init_db():
             if "active_persona_id" not in u_columns:
                 c.execute("ALTER TABLE users ADD COLUMN active_persona_id INTEGER")
 
-        # Проверка и добавление дефолтных персонажей, если их нет
         c.execute("SELECT COUNT(*) FROM characters WHERE user_id = 0")
         if c.fetchone()[0] == 0:
             default_chars = [
@@ -210,9 +216,9 @@ def init_db():
 
         conn.commit()
         conn.close()
-        print("🟢 База данных успешно инициализирована!")
+        logging.info("🟢 База данных успешно инициализирована!")
     except Exception as e:
-        print(f"🔴 Ошибка при инициализации базы данных: {e}")
+        logging.error(f"🔴 Ошибка при инициализации базы данных: {e}")
 
 
 # --- СИСТЕМА УРОВНЯ ДОВЕРИЯ ---
@@ -281,6 +287,23 @@ def main_menu_kb():
     )
 
 
+def cancel_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="❌ Отмена")]],
+        resize_keyboard=True
+    )
+
+
+def skip_or_cancel_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="⏭ Пропустить")],
+            [KeyboardButton(text="❌ Отмена")]
+        ],
+        resize_keyboard=True
+    )
+
+
 def regen_kb():
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -293,9 +316,9 @@ def get_characters_kb(user_id: int):
     conn = DBConnection()
     c = conn.cursor()
     if conn.is_pg:
-        c.execute("SELECT id, name, user_id FROM characters WHERE user_id IN (0, %s)", (user_id,))
+        c.execute("SELECT id, name, user_id FROM characters WHERE user_id IN (0, %s) ORDER BY id ASC", (user_id,))
     else:
-        c.execute("SELECT id, name, user_id FROM characters WHERE user_id IN (0, ?)", (user_id,))
+        c.execute("SELECT id, name, user_id FROM characters WHERE user_id IN (0, ?) ORDER BY id ASC", (user_id,))
     chars = c.fetchall()
     conn.close()
 
@@ -310,15 +333,23 @@ def get_personas_kb(user_id: int):
     conn = DBConnection()
     c = conn.cursor()
     if conn.is_pg:
-        c.execute("SELECT id, name FROM user_personas WHERE user_id = %s", (user_id,))
+        c.execute("SELECT active_persona_id FROM users WHERE user_id = %s", (user_id,))
     else:
-        c.execute("SELECT id, name FROM user_personas WHERE user_id = ?", (user_id,))
+        c.execute("SELECT active_persona_id FROM users WHERE user_id = ?", (user_id,))
+    u_row = c.fetchone()
+    active_id = u_row[0] if u_row else None
+
+    if conn.is_pg:
+        c.execute("SELECT id, name FROM user_personas WHERE user_id = %s ORDER BY id ASC", (user_id,))
+    else:
+        c.execute("SELECT id, name FROM user_personas WHERE user_id = ? ORDER BY id ASC", (user_id,))
     personas = c.fetchall()
     conn.close()
 
     buttons = []
     for persona_id, name in personas:
-        buttons.append([InlineKeyboardButton(text=f"👤 {name}", callback_data=f"viewpersona_{persona_id}")])
+        prefix = "✅ " if persona_id == active_id else "👤 "
+        buttons.append([InlineKeyboardButton(text=f"{prefix}{name}", callback_data=f"viewpersona_{persona_id}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -334,7 +365,7 @@ def get_active_persona_text(user_id: int) -> str:
     if not row or not row[0]:
         conn.close()
         return "Игрок (без детального описания)"
-    
+
     persona_id = row[0]
     if conn.is_pg:
         c.execute("SELECT name, profile_text FROM user_personas WHERE id = %s", (persona_id,))
@@ -358,11 +389,41 @@ def set_active_character(user_id: int, char_id: int):
     active_persona = row[0] if row else None
 
     if conn.is_pg:
-        c.execute("INSERT INTO users (user_id, active_char_id, active_persona_id) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET active_char_id = EXCLUDED.active_char_id, active_persona_id = EXCLUDED.active_persona_id", (user_id, char_id, active_persona))
-        c.execute("INSERT INTO relationships (user_id, char_id, affection) VALUES (%s, %s, %s) ON CONFLICT (user_id, char_id) DO NOTHING", (user_id, char_id, DEFAULT_AFFECTION))
+        c.execute(
+            "INSERT INTO users (user_id, active_char_id, active_persona_id) VALUES (%s, %s, %s) "
+            "ON CONFLICT (user_id) DO UPDATE SET active_char_id = EXCLUDED.active_char_id, active_persona_id = EXCLUDED.active_persona_id",
+            (user_id, char_id, active_persona)
+        )
+        c.execute(
+            "INSERT INTO relationships (user_id, char_id, affection) VALUES (%s, %s, %s) "
+            "ON CONFLICT (user_id, char_id) DO NOTHING",
+            (user_id, char_id, DEFAULT_AFFECTION)
+        )
     else:
         c.execute("INSERT OR REPLACE INTO users (user_id, active_char_id, active_persona_id) VALUES (?, ?, ?)", (user_id, char_id, active_persona))
         c.execute("INSERT OR IGNORE INTO relationships (user_id, char_id, affection) VALUES (?, ?, ?)", (user_id, char_id, DEFAULT_AFFECTION))
+    conn.commit()
+    conn.close()
+
+
+def set_active_persona(user_id: int, persona_id: int | None):
+    conn = DBConnection()
+    c = conn.cursor()
+    if conn.is_pg:
+        c.execute("SELECT active_char_id FROM users WHERE user_id = %s", (user_id,))
+    else:
+        c.execute("SELECT active_char_id FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    active_char = row[0] if row else None
+
+    if conn.is_pg:
+        c.execute(
+            "INSERT INTO users (user_id, active_char_id, active_persona_id) VALUES (%s, %s, %s) "
+            "ON CONFLICT (user_id) DO UPDATE SET active_persona_id = EXCLUDED.active_persona_id",
+            (user_id, active_char, persona_id)
+        )
+    else:
+        c.execute("INSERT OR REPLACE INTO users (user_id, active_char_id, active_persona_id) VALUES (?, ?, ?)", (user_id, active_char, persona_id))
     conn.commit()
     conn.close()
 
@@ -407,7 +468,11 @@ def update_affection(user_id: int, char_id: int, delta: int) -> int:
     conn = DBConnection()
     c = conn.cursor()
     if conn.is_pg:
-        c.execute("INSERT INTO relationships (user_id, char_id, affection) VALUES (%s, %s, %s) ON CONFLICT (user_id, char_id) DO UPDATE SET affection = EXCLUDED.affection", (user_id, char_id, new_score))
+        c.execute(
+            "INSERT INTO relationships (user_id, char_id, affection) VALUES (%s, %s, %s) "
+            "ON CONFLICT (user_id, char_id) DO UPDATE SET affection = EXCLUDED.affection",
+            (user_id, char_id, new_score)
+        )
     else:
         c.execute("INSERT OR REPLACE INTO relationships (user_id, char_id, affection) VALUES (?, ?, ?)", (user_id, char_id, new_score))
     conn.commit()
@@ -466,7 +531,11 @@ def clear_history(user_id: int, char_id: int):
     c = conn.cursor()
     if conn.is_pg:
         c.execute("DELETE FROM messages WHERE user_id = %s AND char_id = %s", (user_id, char_id))
-        c.execute("INSERT INTO relationships (user_id, char_id, affection) VALUES (%s, %s, %s) ON CONFLICT (user_id, char_id) DO UPDATE SET affection = EXCLUDED.affection", (user_id, char_id, DEFAULT_AFFECTION))
+        c.execute(
+            "INSERT INTO relationships (user_id, char_id, affection) VALUES (%s, %s, %s) "
+            "ON CONFLICT (user_id, char_id) DO UPDATE SET affection = EXCLUDED.affection",
+            (user_id, char_id, DEFAULT_AFFECTION)
+        )
     else:
         c.execute("DELETE FROM messages WHERE user_id = ? AND char_id = ?", (user_id, char_id))
         c.execute("INSERT OR REPLACE INTO relationships (user_id, char_id, affection) VALUES (?, ?, ?)", (user_id, char_id, DEFAULT_AFFECTION))
@@ -474,12 +543,41 @@ def clear_history(user_id: int, char_id: int):
     conn.close()
 
 
+# --- ВСПОМОГАТЕЛЬНАЯ ОТПРАВКА СООБЩЕНИЙ ---
+async def safe_send_text(message: types.Message, text: str, reply_markup=None):
+    try:
+        return await message.answer(text, parse_mode="Markdown", reply_markup=reply_markup)
+    except Exception:
+        return await message.answer(text, reply_markup=reply_markup)
+
+
+async def send_with_avatar(message: types.Message, text: str, avatar_url: str, reply_markup=None):
+    if avatar_url and len(text) <= 1000:
+        try:
+            return await message.answer_photo(photo=avatar_url, caption=text, parse_mode="Markdown", reply_markup=reply_markup)
+        except Exception:
+            try:
+                return await message.answer_photo(photo=avatar_url, caption=text, reply_markup=reply_markup)
+            except Exception:
+                pass
+    return await safe_send_text(message, text, reply_markup=reply_markup)
+
+
 # --- ГЕНЕРАЦИЯ ОТВЕТА ---
 async def generate_ai_reply(system_prompt: str, history: list, current_score: int, user_profile: str) -> tuple[str, str, int]:
     status_title, behavior_guide = get_relationship_status(current_score)
 
-    system_instruction = "Персонаж и его правила:\n" + system_prompt + "\n\nИнформация об игроке:\n" + user_profile + "\n\nУровень связи: " + str(current_score) + "/100 (" + status_title + "). " + behavior_guide + "\n\nПравила:\n1. Пиши на русском языке, без латиницы и иностранных слов.\n2. Отвечай от первого лица, действия пиши в *звездочках*.\n3. В конце ответа укажи настроение и дельту в формате:\n[MOOD: спокойный интерес | DELTA: +2]"
-    
+    system_instruction = (
+        f"Персонаж и его правила:\n{system_prompt}\n\n"
+        f"Информация об игроке:\n{user_profile}\n\n"
+        f"Уровень связи: {current_score}/100 ({status_title}). {behavior_guide}\n\n"
+        "Правила:\n"
+        "1. Пиши на русском языке, без латиницы и иностранных слов.\n"
+        "2. Отвечай от первого лица, действия пиши в *звездочках*.\n"
+        "3. В конце ответа укажи настроение и дельту в формате:\n"
+        "[MOOD: спокойный интерес | DELTA: +2]"
+    )
+
     messages = [{"role": "system", "content": system_instruction}] + history
 
     raw_reply = None
@@ -523,3 +621,454 @@ async def generate_ai_reply(system_prompt: str, history: list, current_score: in
         clean_reply = raw_reply
 
     return clean_reply, mood, delta
+
+
+# ================= ОБРАБОТЧИКИ КОМАНД И МЕНЮ =================
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "👋 **Добро пожаловать в мир ролевых ИИ-персонажей!**\n\n"
+        "Используйте меню ниже, чтобы выбрать персонажа, создать своего героя или настроить свою персону (анкету игрока).",
+        parse_mode="Markdown",
+        reply_markup=main_menu_kb()
+    )
+
+
+@dp.message(F.text == "❌ Отмена", StateFilter("*"))
+async def cancel_state(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Действие отменено.", reply_markup=main_menu_kb())
+
+
+# --- ВЫБОР ПЕРСОНАЖА ---
+@dp.message(F.text == "🎭 Выбрать персонажа")
+async def menu_choose_char(message: types.Message, state: FSMContext):
+    await state.clear()
+    kb = get_characters_kb(message.from_user.id)
+    await message.answer("🎭 **Выберите персонажа для общения:**", parse_mode="Markdown", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("selectchar_"))
+async def cb_select_char(call: types.CallbackQuery):
+    char_id = int(call.data.split("_")[1])
+    user_id = call.from_user.id
+
+    set_active_character(user_id, char_id)
+    char = get_active_character(user_id)
+    if not char:
+        await call.answer("Персонаж не найден", show_alert=True)
+        return
+
+    _, name, _, greeting, avatar_url, _ = char
+    score = get_affection(user_id, char_id)
+    history = get_chat_history(user_id, char_id)
+
+    await call.answer()
+
+    if history:
+        last_msg = history[-1]["content"]
+        footer = format_affection_footer(score, 0, "Возврат к диалогу")
+        text = f"✅ **Вы вернулись к {name}.**\n\nПоследняя реплика:\n{last_msg}{footer}"
+        await send_with_avatar(call.message, text, avatar_url, reply_markup=regen_kb())
+    else:
+        save_message(user_id, char_id, "assistant", greeting, 0)
+        footer = format_affection_footer(score, 0, "Начало истории")
+        text = f"✅ **Выбран персонаж:** {name}\n\n{greeting}{footer}"
+        await send_with_avatar(call.message, text, avatar_url)
+
+
+# --- СОЗДАНИЕ ПЕРСОНАЖА ---
+@dp.message(F.text == "➕ Создать персонажа")
+async def start_create_char(message: types.Message, state: FSMContext):
+    await state.set_state(CreateChar.name)
+    await message.answer("Введите **имя** нового персонажа (можно со смайликом):", parse_mode="Markdown", reply_markup=cancel_kb())
+
+
+@dp.message(CreateChar.name)
+async def process_char_name(message: types.Message, state: FSMContext):
+    if not message.text:
+        return
+    await state.update_data(name=message.text.strip())
+    await state.set_state(CreateChar.prompt)
+    await message.answer(
+        "Опишите **характер, лор и манеру речи** персонажа (системный промпт):",
+        parse_mode="Markdown",
+        reply_markup=cancel_kb()
+    )
+
+
+@dp.message(CreateChar.prompt)
+async def process_char_prompt(message: types.Message, state: FSMContext):
+    if not message.text:
+        return
+    await state.update_data(prompt=message.text.strip())
+    await state.set_state(CreateChar.greeting)
+    await message.answer(
+        "Напишите **первое сообщение (приветствие)**, с которого персонаж начнет диалог (действия в *звездочках*):",
+        parse_mode="Markdown",
+        reply_markup=cancel_kb()
+    )
+
+
+@dp.message(CreateChar.greeting)
+async def process_char_greeting(message: types.Message, state: FSMContext):
+    if not message.text:
+        return
+    await state.update_data(greeting=message.text.strip())
+    await state.set_state(CreateChar.avatar)
+    await message.answer(
+        "Отправьте **картинку (фото)** или прямую **ссылку на изображение** для аватара персонажа (или нажмите «⏭ Пропустить»):",
+        parse_mode="Markdown",
+        reply_markup=skip_or_cancel_kb()
+    )
+
+
+@dp.message(CreateChar.avatar)
+async def process_char_avatar(message: types.Message, state: FSMContext):
+    avatar_url = ""
+    if message.photo:
+        avatar_url = message.photo[-1].file_id
+    elif message.text and message.text.strip() != "⏭ Пропустить":
+        avatar_url = message.text.strip()
+
+    data = await state.get_data()
+    user_id = message.from_user.id
+
+    conn = DBConnection()
+    c = conn.cursor()
+    if conn.is_pg:
+        c.execute(
+            "INSERT INTO characters (user_id, name, prompt, greeting, avatar_url) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            (user_id, data["name"], data["prompt"], data["greeting"], avatar_url)
+        )
+        char_id = c.fetchone()[0]
+    else:
+        c.execute(
+            "INSERT INTO characters (user_id, name, prompt, greeting, avatar_url) VALUES (?, ?, ?, ?, ?)",
+            (user_id, data["name"], data["prompt"], data["greeting"], avatar_url)
+        )
+        char_id = c.lastrowid
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+    set_active_character(user_id, char_id)
+    clear_history(user_id, char_id)
+    save_message(user_id, char_id, "assistant", data["greeting"], 0)
+
+    footer = format_affection_footer(DEFAULT_AFFECTION, 0, "Начало истории")
+    await message.answer(f"🎉 Персонаж **{data['name']}** успешно создан и выбран!", parse_mode="Markdown", reply_markup=main_menu_kb())
+    await send_with_avatar(message, f"{data['greeting']}{footer}", avatar_url)
+
+
+# --- МОИ ПЕРСОНЫ ---
+@dp.message(F.text == "👥 Мои персоны")
+async def menu_personas(message: types.Message, state: FSMContext):
+    await state.clear()
+    kb = get_personas_kb(message.from_user.id)
+    if not kb.inline_keyboard:
+        await message.answer(
+            "У вас пока нет созданных персон.\nНажмите **«➕ Создать персону»**, чтобы персонажи знали, кто вы!",
+            parse_mode="Markdown"
+        )
+        return
+    await message.answer("👥 **Ваши персоны** (нажмите для просмотра и выбора):", parse_mode="Markdown", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("viewpersona_"))
+async def cb_view_persona(call: types.CallbackQuery):
+    persona_id = int(call.data.split("_")[1])
+    user_id = call.from_user.id
+
+    conn = DBConnection()
+    c = conn.cursor()
+    if conn.is_pg:
+        c.execute("SELECT name, profile_text, avatar_url FROM user_personas WHERE id = %s AND user_id = %s", (persona_id, user_id))
+    else:
+        c.execute("SELECT name, profile_text, avatar_url FROM user_personas WHERE id = ? AND user_id = ?", (persona_id, user_id))
+    row = c.fetchall()
+    conn.close()
+
+    if not row:
+        await call.answer("Персона не найдена.", show_alert=True)
+        return
+
+    name, profile_text, avatar_url = row[0]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Сделать активной", callback_data=f"setpersona_{persona_id}")],
+        [InlineKeyboardButton(text="✏️ Редактировать описание", callback_data=f"editpersona_{persona_id}")],
+        [InlineKeyboardButton(text="🗑 Удалить персону", callback_data=f"delpersona_{persona_id}")]
+    ])
+
+    await call.answer()
+    text = f"👤 **Персона:** {name}\n\n📝 **Описание:**\n{profile_text}"
+    await send_with_avatar(call.message, text, avatar_url, reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("setpersona_"))
+async def cb_set_persona(call: types.CallbackQuery):
+    persona_id = int(call.data.split("_")[1])
+    set_active_persona(call.from_user.id, persona_id)
+    await call.answer("Персона выбрана активной!")
+    await call.message.answer("✅ Активная персона обновлена! Теперь персонажи будут учитывать эту анкету.")
+
+
+@dp.callback_query(F.data.startswith("delpersona_"))
+async def cb_del_persona(call: types.CallbackQuery):
+    persona_id = int(call.data.split("_")[1])
+    user_id = call.from_user.id
+
+    conn = DBConnection()
+    c = conn.cursor()
+    if conn.is_pg:
+        c.execute("DELETE FROM user_personas WHERE id = %s AND user_id = %s", (persona_id, user_id))
+        c.execute("UPDATE users SET active_persona_id = NULL WHERE user_id = %s AND active_persona_id = %s", (user_id, persona_id))
+    else:
+        c.execute("DELETE FROM user_personas WHERE id = ? AND user_id = ?", (persona_id, user_id))
+        c.execute("UPDATE users SET active_persona_id = NULL WHERE user_id = ? AND active_persona_id = ?", (user_id, persona_id))
+    conn.commit()
+    conn.close()
+
+    await call.answer("Персона удалена")
+    await call.message.answer("🗑 Персона была удалена.")
+
+
+@dp.callback_query(F.data.startswith("editpersona_"))
+async def cb_edit_persona(call: types.CallbackQuery, state: FSMContext):
+    persona_id = int(call.data.split("_")[1])
+    await state.update_data(persona_id=persona_id)
+    await state.set_state(EditPersona.text)
+    await call.answer()
+    await call.message.answer("Введите **новое описание** для вашей персоны:", parse_mode="Markdown", reply_markup=cancel_kb())
+
+
+@dp.message(EditPersona.text)
+async def process_edit_persona_text(message: types.Message, state: FSMContext):
+    if not message.text:
+        return
+    data = await state.get_data()
+    persona_id = data["persona_id"]
+
+    conn = DBConnection()
+    c = conn.cursor()
+    if conn.is_pg:
+        c.execute("UPDATE user_personas SET profile_text = %s WHERE id = %s AND user_id = %s", (message.text.strip(), persona_id, message.from_user.id))
+    else:
+        c.execute("UPDATE user_personas SET profile_text = ? WHERE id = ? AND user_id = ?", (message.text.strip(), persona_id, message.from_user.id))
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+    await message.answer("✅ Описание персоны успешно обновлено!", reply_markup=main_menu_kb())
+
+
+# --- СОЗДАНИЕ ПЕРСОНЫ ---
+@dp.message(F.text == "➕ Создать персону")
+async def start_create_persona(message: types.Message, state: FSMContext):
+    await state.set_state(CreatePersona.name)
+    await message.answer("Введите **имя или прозвище** вашей персоны:", parse_mode="Markdown", reply_markup=cancel_kb())
+
+
+@dp.message(CreatePersona.name)
+async def process_persona_name(message: types.Message, state: FSMContext):
+    if not message.text:
+        return
+    await state.update_data(name=message.text.strip())
+    await state.set_state(CreatePersona.text)
+    await message.answer(
+        "Опишите **себя (внешность, характер, род занятий)**, чтобы персонажи учитывали это в диалоге:",
+        parse_mode="Markdown",
+        reply_markup=cancel_kb()
+    )
+
+
+@dp.message(CreatePersona.text)
+async def process_persona_text(message: types.Message, state: FSMContext):
+    if not message.text:
+        return
+    await state.update_data(text=message.text.strip())
+    await state.set_state(CreatePersona.avatar)
+    await message.answer(
+        "Отправьте **фото** или **ссылку на картинку** для вашей персоны (или нажмите «⏭ Пропустить»):",
+        parse_mode="Markdown",
+        reply_markup=skip_or_cancel_kb()
+    )
+
+
+@dp.message(CreatePersona.avatar)
+async def process_persona_avatar(message: types.Message, state: FSMContext):
+    avatar_url = ""
+    if message.photo:
+        avatar_url = message.photo[-1].file_id
+    elif message.text and message.text.strip() != "⏭ Пропустить":
+        avatar_url = message.text.strip()
+
+    data = await state.get_data()
+    user_id = message.from_user.id
+
+    conn = DBConnection()
+    c = conn.cursor()
+    if conn.is_pg:
+        c.execute(
+            "INSERT INTO user_personas (user_id, name, profile_text, avatar_url) VALUES (%s, %s, %s, %s) RETURNING id",
+            (user_id, data["name"], data["text"], avatar_url)
+        )
+        persona_id = c.fetchone()[0]
+    else:
+        c.execute(
+            "INSERT INTO user_personas (user_id, name, profile_text, avatar_url) VALUES (?, ?, ?, ?)",
+            (user_id, data["name"], data["text"], avatar_url)
+        )
+        persona_id = c.lastrowid
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+    set_active_persona(user_id, persona_id)
+    await message.answer(
+        f"✅ Персона **{data['name']}** создана и установлена как активная!",
+        parse_mode="Markdown",
+        reply_markup=main_menu_kb()
+    )
+
+
+# --- СБРОС ДИАЛОГА И УДАЛЕНИЕ ПЕРСОНАЖА ---
+@dp.message(F.text == "🔄 Сбросить диалог")
+async def menu_reset_dialog(message: types.Message):
+    user_id = message.from_user.id
+    char = get_active_character(user_id)
+    if not char:
+        await message.answer("Сначала выберите персонажа через «🎭 Выбрать персонажа».")
+        return
+
+    char_id, name, _, greeting, avatar_url, _ = char
+    clear_history(user_id, char_id)
+    save_message(user_id, char_id, "assistant", greeting, 0)
+
+    footer = format_affection_footer(DEFAULT_AFFECTION, 0, "Начало истории")
+    text = f"🔄 **Диалог с {name} сброшен!**\n\n{greeting}{footer}"
+    await send_with_avatar(message, text, avatar_url)
+
+
+@dp.message(F.text == "🗑 Удалить текущего")
+async def menu_delete_char(message: types.Message):
+    user_id = message.from_user.id
+    char = get_active_character(user_id)
+    if not char:
+        await message.answer("У вас не выбран активный персонаж.")
+        return
+
+    char_id, name, _, _, _, owner_id = char
+    if owner_id == 0:
+        await message.answer("⚠️ Базовых персонажей удалить нельзя. Вы можете удалять только созданных вами персонажей.")
+        return
+
+    conn = DBConnection()
+    c = conn.cursor()
+    if conn.is_pg:
+        c.execute("DELETE FROM characters WHERE id = %s AND user_id = %s", (char_id, user_id))
+        c.execute("DELETE FROM messages WHERE char_id = %s AND user_id = %s", (char_id, user_id))
+        c.execute("DELETE FROM relationships WHERE char_id = %s AND user_id = %s", (char_id, user_id))
+        c.execute("UPDATE users SET active_char_id = NULL WHERE user_id = %s", (user_id,))
+    else:
+        c.execute("DELETE FROM characters WHERE id = ? AND user_id = ?", (char_id, user_id))
+        c.execute("DELETE FROM messages WHERE char_id = ? AND user_id = ?", (char_id, user_id))
+        c.execute("DELETE FROM relationships WHERE char_id = ? AND user_id = ?", (char_id, user_id))
+        c.execute("UPDATE users SET active_char_id = NULL WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+    await message.answer(f"🗑 Персонаж **{name}** был удален.", parse_mode="Markdown")
+
+
+# --- ПЕРЕГЕНЕРАЦИЯ ОТВЕТА ---
+@dp.callback_query(F.data == "regenerate")
+async def cb_regenerate(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    char = get_active_character(user_id)
+    if not char:
+        await call.answer("Персонаж не выбран", show_alert=True)
+        return
+
+    char_id, _, system_prompt, _, _, _ = char
+    if not delete_last_assistant_message(user_id, char_id):
+        await call.answer("Нечего перегенерировать", show_alert=True)
+        return
+
+    await call.answer("Генерирую новый вариант...")
+    await bot.send_chat_action(call.message.chat.id, "typing")
+
+    history = get_chat_history(user_id, char_id)
+    current_score = get_affection(user_id, char_id)
+    user_profile = get_active_persona_text(user_id)
+
+    reply_text, mood, delta = await generate_ai_reply(system_prompt, history, current_score, user_profile)
+    new_score = update_affection(user_id, char_id, delta)
+    save_message(user_id, char_id, "assistant", reply_text, delta)
+
+    full_text = reply_text + format_affection_footer(new_score, delta, mood)
+    await safe_send_text(call.message, full_text, reply_markup=regen_kb())
+
+
+# --- ОСНОВНОЙ ДИАЛОГ С ИИ ---
+@dp.message(F.text)
+async def handle_chat_message(message: types.Message):
+    user_id = message.from_user.id
+    char = get_active_character(user_id)
+    if not char:
+        await message.answer(
+            "🎭 Сначала выберите персонажа, нажав кнопку **«🎭 Выбрать персонажа»** в меню!",
+            parse_mode="Markdown",
+            reply_markup=main_menu_kb()
+        )
+        return
+
+    char_id, _, system_prompt, _, _, _ = char
+    user_text = message.text.strip()
+
+    await bot.send_chat_action(message.chat.id, "typing")
+    save_message(user_id, char_id, "user", user_text, 0)
+
+    history = get_chat_history(user_id, char_id)
+    current_score = get_affection(user_id, char_id)
+    user_profile = get_active_persona_text(user_id)
+
+    reply_text, mood, delta = await generate_ai_reply(system_prompt, history, current_score, user_profile)
+    new_score = update_affection(user_id, char_id, delta)
+    save_message(user_id, char_id, "assistant", reply_text, delta)
+
+    full_text = reply_text + format_affection_footer(new_score, delta, mood)
+    await safe_send_text(message, full_text, reply_markup=regen_kb())
+
+
+# ================= ВЕБ-СЕРВЕР ДЛЯ RENDER И ЗАПУСК =================
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+    def log_message(self, format, *args):
+        return  # Отключаем спам HTTP-запросов в логах
+
+
+def start_health_server():
+    port = int(os.getenv("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    logging.info(f"🌐 Фоновый HTTP-сервер запущен на порту {port}")
+    server.serve_forever()
+
+
+async def main():
+    init_db()
+    await bot.delete_webhook(drop_pending_updates=True)
+    logging.info("🚀 Бот запущен и готов к работе!")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    threading.Thread(target=start_health_server, daemon=True).start()
+    asyncio.run(main())
