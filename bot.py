@@ -16,10 +16,9 @@ from aiogram.types import (
 from openai import AsyncOpenAI
 
 # ================= НАСТРОЙКИ =================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN",)
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-# Бесплатные ролевые модели
 FREE_MODELS = [
     "google/gemma-3-27b-it:free",
     "meta-llama/llama-3.3-70b-instruct:free",
@@ -62,6 +61,12 @@ def init_db():
         )
     """)
     c.execute("""
+        CREATE TABLE IF NOT EXISTS user_profiles (
+            user_id INTEGER PRIMARY KEY,
+            profile_text TEXT
+        )
+    """)
+    c.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -80,36 +85,27 @@ def init_db():
         )
     """)
 
-    # Миграция таблицы characters (добавление колонки avatar_url, если её не было)
     c.execute("PRAGMA table_info(characters)")
     columns = [col[1] for col in c.fetchall()]
     if "avatar_url" not in columns:
         c.execute("ALTER TABLE characters ADD COLUMN avatar_url TEXT DEFAULT ''")
 
-    # Базовые персонажи с аватарками
     c.execute("SELECT COUNT(*) FROM characters WHERE user_id = 0")
     if c.fetchone()[0] == 0:
         default_chars = [
             (
                 0,
                 "🕵️‍♂️ Шерлок Холмс",
-                "Ты Шерлок Холмс, гениальный детектив с Бейкер-стрит. Наблюдателен, ироничен, ценишь острый ум, логику и преданных напарников. Общаешься увлекательно, подмечаешь детали.",
+                "Ты Шерлок Холмс, гениальный детектив с Бейкер-стрит. Наблюдателен, ироничен, ценишь острый ум, логику и преданных напарников.",
                 "*Откладывает скрипку в сторону и внимательно осматривает вас с ног до головы* Любопытно. Вы явно пришли с делом, которое не терпит отлагательств. Рассказывайте.",
                 "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=500"
             ),
             (
                 0,
                 "👾 Никс (Хакерша)",
-                "Ты Никс — дерзкая девушка-нетраннер из неонового мегаполиса. Общаешься живо, с киберпанк-сленгом и сарказмом, но всегда готова прикрыть спину друга в переделке.",
-                "*Поправляет светящиеся неоновые очки и отпивает энергетик, не отрывая взгляда от голографических мониторов* О, живой человек в моем бункере. Какими судьбами?",
+                "Ты Никс — дерзкая девушка-нетраннер из неонового мегаполиса. Общаешься живо, с киберпанк-сленгом и сарказмом.",
+                "*Поправляет светящиеся неоновые очки и отпивает энергетик* О, живой человек в моем бункере. Какими судьбами?",
                 "https://images.unsplash.com/photo-1517841905240-472988babdf9?w=500"
-            ),
-            (
-                0,
-                "🧙‍♂️ Элдор (Маг)",
-                "Ты старый мудрый маг-отшельник. Обладаешь глубокими знаниями, философским юмором и готов давать советы путешественникам, попавшим в беду.",
-                "*Медленно поворачивается у каменного алтаря, опираясь на посох с мерцающим кристаллом* Давно в этих краях не ступала нога путника. Присаживайся у костра.",
-                "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=500"
             )
         ]
         c.executemany(
@@ -120,18 +116,18 @@ def init_db():
     conn.close()
 
 
-# --- СИСТЕМА УРОВНЯ ДОВЕРИЯ И СИМПАТИИ ---
+# --- СИСТЕМА УРОВНЯ ДОВЕРИЯ ---
 def get_relationship_status(score: int) -> tuple[str, str]:
     if score <= 15:
         return ("❄️ Холод и недоверие", "Держишь жесткую дистанцию и относишься настороженно.")
     elif score <= 35:
         return ("🤝 Знакомые / Напарники", "Общаешься в своем обычном характере, присматриваешься к собеседнику.")
     elif score <= 55:
-        return ("😊 Хорошие друзья", "Доверяешь собеседнику, охотно шутишь, проявляешь теплоту и поддержку.")
+        return ("😊 Хорошие друзья", "Доверяешь собеседнику, охотно шутишь, проявляешь теплоту.")
     elif score <= 75:
-        return ("🔥 Близкие союзники", "Между вами крепкая связь, взаимовыручка и доверие без утайки.")
+        return ("🔥 Близкие союзники", "Между вами крепкая связь и доверие без утайки.")
     else:
-        return ("💎 Полное доверие", "Самый надежный партнер и верный друг, абсолютное взаимопонимание.")
+        return ("💎 Полное доверие", "Самый надежный партнер, абсолютное взаимопонимание.")
 
 
 def format_affection_footer(score: int, delta: int, mood: str) -> str:
@@ -154,7 +150,7 @@ def format_affection_footer(score: int, delta: int, mood: str) -> str:
     )
 
 
-# --- СОСТОЯНИЯ ДЛЯ СОЗДАНИЯ ПЕРСОНАЖА ---
+# --- СОСТОЯНИЯ ---
 class CreateChar(StatesGroup):
     name = State()
     prompt = State()
@@ -162,12 +158,17 @@ class CreateChar(StatesGroup):
     avatar_url = State()
 
 
+class CreateProfile(StatesGroup):
+    text = State()
+
+
 # --- КЛАВИАТУРЫ ---
 def main_menu_kb():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🎭 Выбрать персонажа"), KeyboardButton(text="➕ Создать персонажа")],
-            [KeyboardButton(text="🔄 Сбросить диалог"), KeyboardButton(text="🗑 Удалить текущего")]
+            [KeyboardButton(text="👤 Моя персона"), KeyboardButton(text="🔄 Сбросить диалог")],
+            [KeyboardButton(text="🗑 Удалить текущего")]
         ],
         resize_keyboard=True
     )
@@ -184,10 +185,7 @@ def regen_kb():
 def get_characters_kb(user_id: int):
     conn = sqlite3.connect("characters.db")
     c = conn.cursor()
-    c.execute(
-        "SELECT id, name, user_id FROM characters WHERE user_id IN (0, ?)",
-        (user_id,)
-    )
+    c.execute("SELECT id, name, user_id FROM characters WHERE user_id IN (0, ?)", (user_id,))
     chars = c.fetchall()
     conn.close()
 
@@ -198,7 +196,24 @@ def get_characters_kb(user_id: int):
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-# --- РАБОТА С БД ---
+# --- РАБОТА С БД (ПЕРСОНА И ПРОФИЛЬ) ---
+def get_user_profile(user_id: int) -> str:
+    conn = sqlite3.connect("characters.db")
+    c = conn.cursor()
+    c.execute("SELECT profile_text FROM user_profiles WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else "Игрок (без детального описания)"
+
+
+def set_user_profile(user_id: int, text: str):
+    conn = sqlite3.connect("characters.db")
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO user_profiles (user_id, profile_text) VALUES (?, ?)", (user_id, text))
+    conn.commit()
+    conn.close()
+
+
 def set_active_character(user_id: int, char_id: int):
     conn = sqlite3.connect("characters.db")
     c = conn.cursor()
@@ -206,20 +221,6 @@ def set_active_character(user_id: int, char_id: int):
     c.execute("INSERT OR IGNORE INTO relationships (user_id, char_id, score) VALUES (?, ?, ?)", (user_id, char_id, DEFAULT_AFFECTION))
     conn.commit()
     conn.close()
-
-
-def get_active_character(user_id: int):
-    conn = sqlite3.connect("characters.db")
-    c = conn.cursor()
-    c.execute("""
-        SELECT c.id, c.name, c.prompt, c.greeting, c.avatar_url, c.user_id
-        FROM users u
-        JOIN characters c u.active_char_id = c.id
-        WHERE u.user_id = ?
-    """, (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return row
 
 
 def get_active_character(user_id: int):
@@ -299,12 +300,13 @@ def clear_history(user_id: int, char_id: int):
     conn.close()
 
 
-# --- ГЕНЕРАЦИЯ ОТВЕТА ИИ ---
-async def generate_ai_reply(system_prompt: str, history: list, current_score: int) -> tuple[str, str, int]:
+# --- ГЕНЕРАЦИЯ ОТВЕТА С УЧЕТОМ ПЕРСОНЫ ---
+async def generate_ai_reply(system_prompt: str, history: list, current_score: int, user_profile: str) -> tuple[str, str, int]:
     status_title, behavior_guide = get_relationship_status(current_score)
 
     system_instruction = (
         f"{system_prompt}\n\n"
+        f"Информация о собеседнике (Игроке):\n{user_profile}\n\n"
         f"Текущий уровень доверия/связи с собеседником: {current_score}/100 ({status_title}). "
         f"{behavior_guide}\n\n"
         "Правила ролевой игры:\n"
@@ -331,7 +333,6 @@ async def generate_ai_reply(system_prompt: str, history: list, current_score: in
                 raw_reply = response.choices[0].message.content.strip()
                 break
         except Exception as e:
-            logging.warning(f"Модель {model_name} недоступна: {e}")
             last_error = e
             continue
 
@@ -361,7 +362,7 @@ async def generate_ai_reply(system_prompt: str, history: list, current_score: in
 async def cmd_start(message: types.Message):
     await message.answer(
         "👋 **Добро пожаловать в личный Character.AI!**\n\n"
-        "Выбирай персонажа, общайся, прокачивай уровень доверия и создавай собственных героев с аватарками!",
+        "Выбирай персонажа, заполни свою **Персону** (анкету игрока), чтобы герои знали твоё имя и внешность!",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
     )
@@ -371,6 +372,28 @@ async def cmd_start(message: types.Message):
 @dp.message(F.text == "🎭 Выбрать персонажа")
 async def show_characters(message: types.Message):
     await message.answer("Выбери персонажа для общения:", reply_markup=get_characters_kb(message.from_user.id))
+
+
+# --- УПРАВЛЕНИЕ ПЕРСОНОЙ ---
+@dp.message(F.text == "👤 Моя персона")
+async def manage_profile(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    current_profile = get_user_profile(user_id)
+    await state.set_state(CreateProfile.text)
+    await message.answer(
+        f"👤 **Ваша текущая персона:**\n\n{current_profile}\n\n"
+        "✏️ Отправьте новое описание для вашей персоны (ваше имя, возраст, внешность, стиль одежды или роль), чтобы персонажи учитывали это в диалогах:",
+        parse_mode="Markdown"
+    )
+
+
+@dp.message(CreateProfile.text)
+async def save_profile_text(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    new_profile = message.text.strip()
+    set_user_profile(user_id, new_profile)
+    await state.clear()
+    await message.answer("✅ **Ваша персона успешно обновлена!** Теперь все персонажи будут знать вас по этой анкете.", reply_markup=main_menu_kb(), parse_mode="Markdown")
 
 
 @dp.callback_query(F.data.startswith("select_"))
@@ -423,8 +446,9 @@ async def regenerate_reply_callback(callback: types.CallbackQuery):
     await callback.answer("Генерирую новый вариант...")
     current_score = get_affection(user_id, char_id)
     history = get_chat_history(user_id, char_id)
+    user_profile = get_user_profile(user_id)
 
-    clean_reply, mood, delta = await generate_ai_reply(prompt, history, current_score)
+    clean_reply, mood, delta = await generate_ai_reply(prompt, history, current_score, user_profile)
     new_score = update_affection(user_id, char_id, delta)
     save_message(user_id, char_id, "assistant", clean_reply, delta=delta)
 
@@ -472,32 +496,32 @@ async def delete_current_char(message: types.Message):
     await message.answer(f"🗑 Персонаж **{name}** удален.", parse_mode="Markdown")
 
 
-# --- СОЗДАНИЕ ПЕРСОНАЖА (ФОТО + АНКЕТА) ---
+# --- СОЗДАНИЕ ПЕРСОНАЖА ---
 @dp.message(F.text == "➕ Создать персонажа")
 async def start_create_char(message: types.Message, state: FSMContext):
     await state.set_state(CreateChar.name)
-    await message.answer("✏️ **Шаг 1 из 4:** Введите имя вашего персонажа (например, `🧙‍♂️ Гэндальф`):", parse_mode="Markdown")
+    await message.answer("✏️ **Шаг 1 из 4:** Введите имя персонажа:", parse_mode="Markdown")
 
 
 @dp.message(CreateChar.name)
 async def process_char_name(message: types.Message, state: FSMContext):
     await state.update_data(name=message.text.strip())
     await state.set_state(CreateChar.prompt)
-    await message.answer("🧠 **Шаг 2 из 4:** Опишите характер, предысторию и манеру речи персонажа:", parse_mode="Markdown")
+    await message.answer("🧠 **Шаг 2 из 4:** Опишите характер и предысторию персонажа:", parse_mode="Markdown")
 
 
 @dp.message(CreateChar.prompt)
 async def process_char_prompt(message: types.Message, state: FSMContext):
     await state.update_data(prompt=message.text.strip())
     await state.set_state(CreateChar.greeting)
-    await message.answer("💬 **Шаг 3 из 4:** Напишите приветствие (первую фразу персонажа):", parse_mode="Markdown")
+    await message.answer("💬 **Шаг 3 из 4:** Напишите приветствие персонажа:", parse_mode="Markdown")
 
 
 @dp.message(CreateChar.greeting)
 async def process_char_greeting(message: types.Message, state: FSMContext):
     await state.update_data(greeting=message.text.strip())
     await state.set_state(CreateChar.avatar_url)
-    await message.answer("🖼 **Шаг 4 из 4:** Отправьте прямую ссылку на картинку (аватарку) персонажа в интернете (или напишите `нет`, если без картинки):", parse_mode="Markdown")
+    await message.answer("🖼 **Шаг 4 из 4:** Отправьте прямую ссылку на аватарку персонажа (или отправьте `-`, если без картинки):", parse_mode="Markdown")
 
 
 @dp.message(CreateChar.avatar_url)
@@ -554,8 +578,9 @@ async def chat_handler(message: types.Message):
     save_message(user_id, char_id, "user", message.text, delta=0)
     current_score = get_affection(user_id, char_id)
     history = get_chat_history(user_id, char_id)
+    user_profile = get_user_profile(user_id)
 
-    clean_reply, mood, delta = await generate_ai_reply(prompt, history, current_score)
+    clean_reply, mood, delta = await generate_ai_reply(prompt, history, current_score, user_profile)
     new_score = update_affection(user_id, char_id, delta)
     save_message(user_id, char_id, "assistant", clean_reply, delta=delta)
 
@@ -566,7 +591,7 @@ async def chat_handler(message: types.Message):
         await message.answer(full_text, reply_markup=regen_kb())
 
 
-# --- МИНИ-СЕРВЕР ДЛЯ RENDER (УДЕРЖАНИЕ ПОРТА) ---
+# --- МИНИ-СЕРВЕР ДЛЯ RENDER ---
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
