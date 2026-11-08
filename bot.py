@@ -51,6 +51,8 @@ class DBConnection:
         self.is_pg = bool(DATABASE_URL and DATABASE_URL.strip())
         if self.is_pg:
             self.conn = psycopg2.connect(DATABASE_URL.strip())
+            # Включаем autocommit, чтобы запросы выполнялись независимо и курсор не закрывался
+            self.conn.autocommit = True
         else:
             self.conn = sqlite3.connect("characters.db")
 
@@ -58,7 +60,8 @@ class DBConnection:
         return DBCursor(self.conn.cursor(), self.is_pg)
 
     def commit(self):
-        self.conn.commit()
+        if not self.is_pg:
+            self.conn.commit()
 
     def close(self):
         self.conn.close()
