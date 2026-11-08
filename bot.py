@@ -22,11 +22,12 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 FREE_MODELS = [
+    "openrouter/free",
+    "meta-llama/llama-3.3-70b-instruct:free",
     "deepseek/deepseek-chat-v3-0324:free",
+    "deepseek/deepseek-r1:free",
     "google/gemma-3-27b-it:free",
-    "qwen/qwen-2.5-72b-instruct:free",
-    "mistralai/mistral-small-3.1-24b-instruct:free",
-    "openrouter/free"
+    "qwen/qwen3-235b-a22b:free",
 ]
 
 MAX_HISTORY_MESSAGES = 20
@@ -593,11 +594,15 @@ async def generate_ai_reply(system_prompt: str, history: list, current_score: in
                 model=model_name,
                 messages=req_messages,
                 temperature=0.7,
-                max_tokens=650,
+                max_tokens=1500,
             )
             if response.choices and response.choices[0].message.content:
-                raw_reply = response.choices[0].message.content.strip()
-                break
+                content = response.choices[0].message.content.strip()
+                # Убираем блок <think>...</think>, если попалась рассуждающая модель
+                content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                if content:
+                    raw_reply = content
+                    break
         except Exception as e:
             last_error = e
             continue
