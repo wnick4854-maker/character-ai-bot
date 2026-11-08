@@ -16,8 +16,8 @@ from aiogram.types import (
 from openai import AsyncOpenAI
 
 # ================= НАСТРОЙКИ =================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "ВАШ_ТОКЕН_ОТ_BOTFATHER")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "ВАШ_КЛЮЧ_ОТ_OPENROUTER")
 
 FREE_MODELS = [
     "google/gemma-3-27b-it:free",
@@ -66,7 +66,8 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             name TEXT,
-            profile_text TEXT
+            profile_text TEXT,
+            avatar_url TEXT DEFAULT ''
         )
     """)
     c.execute("""
@@ -88,12 +89,12 @@ def init_db():
         )
     """)
 
-    c.execute("PRAGMA table_info(characters)")
-    columns = [col[1] for col in c.fetchall()]
-    if "avatar_url" not in columns:
-        c.execute("ALTER TABLE characters ADD COLUMN avatar_url TEXT DEFAULT ''")
+    # Проверяем колонку аватара у персон (на случай обновления старой базы)
+    c.execute("PRAGMA table_info(user_personas)")
+    p_columns = [col[1] for col in c.fetchall()]
+    if "avatar_url" not in p_columns:
+        c.execute("ALTER TABLE user_personas ADD COLUMN avatar_url TEXT DEFAULT ''")
 
-    # Базовые персонажи
     c.execute("SELECT COUNT(*) FROM characters WHERE user_id = 0")
     if c.fetchone()[0] == 0:
         default_chars = [
@@ -159,16 +160,19 @@ class CreateChar(StatesGroup):
     name = State()
     prompt = State()
     greeting = State()
-    avatar_url = State()
+    avatar = State()
 
 
 class CreatePersona(StatesGroup):
     name = State()
     text = State()
+    avatar = State()
 
 
 class EditPersona(StatesGroup):
+    choice = State() # выбор: текст или фото
     text = State()
+    avatar = State()
 
 
 # --- КЛАВИАТУРЫ ---
@@ -218,7 +222,7 @@ def get_personas_kb(user_id: int):
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-# --- РАБОТА С БД (ПЕРСОНЫ И ПРОФИЛЬ) ---
+# --- РАБОТА С БД ---
 def get_active_persona_text(user_id: int) -> str:
     conn = sqlite3.connect("characters.db")
     c = conn.cursor()
@@ -368,7 +372,7 @@ async def generate_ai_reply(system_prompt: str, history: list, current_score: in
 
     mood = "Нейтральное"
     delta = 0
-    pattern = r"\[MOOD:\s*(.+?)\s*\|\s*DELTA:\s*([+-]?\d+)\s*\]"
+    pattern = r"\[MOOD:\s*(.+?)\s*\Vert{}\s*DELTA:\s*([+-]?\d+)\s*\]"
     match = re.search(pattern, raw_reply, re.IGNORECASE)
     if match:
         mood = match.group(1).strip()
@@ -389,7 +393,7 @@ async def generate_ai_reply(system_prompt: str, history: list, current_score: in
 async def cmd_start(message: types.Message):
     await message.answer(
         "👋 **Добро пожаловать в личный Character.AI!**\n\n"
-        "Выбирай персонажа, управляй своими **персонами** (создавай, редактируй, удаляй) и общайся с погружением!",
+        "Выбирай персонажа, создавай и кастомизируй свои **персоны** с загрузкой фото прямо в чат!",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
     )
@@ -401,7 +405,7 @@ async def show_characters(message: types.Message):
     await message.answer("Выбери персонажа для общения:", reply_markup=get_characters_kb(message.from_user.id))
 
 
-# --- УПРАВЛЕНИЕ ПЕРСОНАМИ ---
+# --- УПРАВЛЕНИЕ ПЕРСОНАМИ С АВАТАРКАМИ ---
 @dp.message(F.text == "👥 Мои персоны")
 async def show_personas(message: types.Message):
     user_id = message.from_user.id
@@ -409,7 +413,7 @@ async def show_personas(message: types.Message):
     if not kb.inline_keyboard:
         await message.answer("У вас пока нет созданных персон. Нажмите «➕ Создать персону» в меню!", reply_markup=main_menu_kb())
         return
-    await message.answer("Выберите персону для просмотра, редактирования или выбора:", reply_markup=kb)
+    await message.answer("Выберите персону для просмотра, выбора, редактирования или удаления:", reply_markup=kb)
 
 
 @dp.callback_query(F.data.startswith("viewpersona_"))
@@ -417,7 +421,7 @@ async def view_persona_callback(callback: types.CallbackQuery):
     persona_id = int(callback.data.split("_")[1])
     conn = sqlite3.connect("characters.db")
     c = conn.cursor()
-    c.execute("SELECT name, profile_text FROM user_personas WHERE id = ?", (persona_id,))
+    c.execute("SELECT name, profile_text, avatar_url FROM user_personas WHERE id = ?", (persona_id,))
     row = c.fetchone()
     conn.close()
 
@@ -425,19 +429,27 @@ async def view_persona_callback(callback: types.CallbackQuery):
         await callback.answer("Персона не найдена.")
         return
 
-    name, text = row
+    name, text, avatar = row
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="✅ Выбрать эту", callback_data=f"selectpersona_{persona_id}")],
-            [InlineKeyboardButton(text="✏️ Изменить описание", callback_data=f"editpersona_{persona_id}")],
+            [InlineKeyboardButton(text="✏️ Изменить текст", callback_data=f"edittext_{persona_id}"),
+             InlineKeyboardButton(text="🖼 Изменить фото", callback_data=f"editphoto_{persona_id}")],
             [InlineKeyboardButton(text="🗑 Удалить персону", callback_data=f"delpersona_{persona_id}")]
         ]
     )
-    await callback.message.edit_text(
-        f"👤 **Персона: {name}**\n\n{text}",
-        reply_markup=kb,
-        parse_mode="Markdown"
-    )
+    
+    caption = f"👤 **Персона: {name}**\n\n{text}"
+    if avatar:
+        try:
+            await callback.message.answer_photo(photo=avatar, caption=caption, reply_markup=kb, parse_mode="Markdown")
+            await callback.message.delete()
+            await callback.answer()
+            return
+        except Exception:
+            pass
+    
+    await callback.message.edit_text(caption, reply_markup=kb, parse_mode="Markdown")
     await callback.answer()
 
 
@@ -464,8 +476,63 @@ async def select_persona_callback(callback: types.CallbackQuery):
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("editpersona_"))
-async def edit_persona_start(callback: types.CallbackQuery, state: FSMContext):
+# --- СОЗДАНИЕ ПЕРСОНЫ (ИМЯ -> ТЕКСТ -> ФОТО) ---
+@dp.message(F.text == "➕ Создать персону")
+async def start_create_persona(message: types.Message, state: FSMContext):
+    await state.set_state(CreatePersona.name)
+    await message.answer("✏️ **Шаг 1 из 3:** Введите имя или название для вашей персоны (например, `Детектив Джон`):", parse_mode="Markdown")
+
+
+@dp.message(CreatePersona.name)
+async def process_persona_name(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text.strip())
+    await state.set_state(CreatePersona.text)
+    await message.answer("🧠 **Шаг 2 из 3:** Опишите вашу персону (возраст, внешность, характер или предысторию):", parse_mode="Markdown")
+
+
+@dp.message(CreatePersona.text)
+async def process_persona_text(message: types.Message, state: FSMContext):
+    await state.update_data(text=message.text.strip())
+    await state.set_state(CreatePersona.avatar)
+    await message.answer("🖼 **Шаг 3 из 3:** Отправьте картинку (аватарку) для этой персоны **напрямую файлом** (или отправьте текст `-`, если без картинки):", parse_mode="Markdown")
+
+
+@dp.message(CreatePersona.avatar, F.photo | F.text)
+async def process_persona_avatar(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    persona_name = data["name"]
+    profile_text = data["text"]
+    
+    avatar_url = ""
+    if message.photo:
+        avatar_url = message.photo[-1].file_id
+    elif message.text and message.text.strip() not in ["-", "нет", "no"]:
+        avatar_url = message.text.strip() # если вдруг скинули ссылку текстом
+
+    user_id = message.from_user.id
+    conn = sqlite3.connect("characters.db")
+    c = conn.cursor()
+    c.execute("INSERT INTO user_personas (user_id, name, profile_text, avatar_url) VALUES (?, ?, ?, ?)", (user_id, persona_name, profile_text, avatar_url))
+    persona_id = c.lastrowid
+    c.execute("INSERT OR IGNORE INTO users (user_id, active_persona_id) VALUES (?, ?)", (user_id, persona_id))
+    c.execute("UPDATE users SET active_persona_id = ? WHERE user_id = ?", (persona_id, user_id))
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+    text = f"🎉 Персона **{persona_name}** создана и установлена как активная!"
+    if avatar_url:
+        try:
+            await message.answer_photo(photo=avatar_url, caption=text, reply_markup=main_menu_kb(), parse_mode="Markdown")
+            return
+        except Exception:
+            pass
+    await message.answer(text, reply_markup=main_menu_kb(), parse_mode="Markdown")
+
+
+# --- РЕДАКТИРОВАНИЕ ПЕРСОНЫ ---
+@dp.callback_query(F.data.startswith("edittext_"))
+async def edit_persona_text_start(callback: types.CallbackQuery, state: FSMContext):
     persona_id = int(callback.data.split("_")[1])
     await state.update_data(edit_persona_id=persona_id)
     await state.set_state(EditPersona.text)
@@ -474,19 +541,49 @@ async def edit_persona_start(callback: types.CallbackQuery, state: FSMContext):
 
 
 @dp.message(EditPersona.text)
-async def edit_persona_save(message: types.Message, state: FSMContext):
+async def edit_persona_text_save(message: types.Message, state: FSMContext):
     data = await state.get_data()
     persona_id = data["edit_persona_id"]
     new_text = message.text.strip()
 
     conn = sqlite3.connect("characters.db")
     c = conn.cursor()
-    c.execute("UPDATE user_personas SET profile_text = ? WHERE id = ?", (persona_id, new_text))
+    c.execute("UPDATE user_personas SET profile_text = ? WHERE id = ?", (new_text, persona_id))
     conn.commit()
     conn.close()
 
     await state.clear()
-    await message.answer("✅ **Описание персоны успешно обновлено!**", reply_markup=main_menu_kb(), parse_mode="Markdown")
+    await message.answer("✅ **Текст персоны успешно обновлен!**", reply_markup=main_menu_kb(), parse_mode="Markdown")
+
+
+@dp.callback_query(F.data.startswith("editphoto_"))
+async def edit_persona_photo_start(callback: types.CallbackQuery, state: FSMContext):
+    persona_id = int(callback.data.split("_")[1])
+    await state.update_data(edit_persona_id=persona_id)
+    await state.set_state(EditPersona.avatar)
+    await callback.message.answer("🖼 Отправьте новую картинку **файлом** (или отправьте `-`, чтобы удалить фото):", parse_mode="Markdown")
+    await callback.answer()
+
+
+@dp.message(EditPersona.avatar, F.photo | F.text)
+async def edit_persona_photo_save(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    persona_id = data["edit_persona_id"]
+    
+    avatar_url = ""
+    if message.photo:
+        avatar_url = message.photo[-1].file_id
+    elif message.text and message.text.strip() not in ["-", "нет", "no"]:
+        avatar_url = message.text.strip()
+
+    conn = sqlite3.connect("characters.db")
+    c = conn.cursor()
+    c.execute("UPDATE user_personas SET avatar_url = ? WHERE id = ?", (avatar_url, persona_id))
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+    await message.answer("✅ **Фото персоны успешно обновлено!**", reply_markup=main_menu_kb(), parse_mode="Markdown")
 
 
 @dp.callback_query(F.data.startswith("delpersona_"))
@@ -497,7 +594,6 @@ async def delete_persona_callback(callback: types.CallbackQuery):
     conn = sqlite3.connect("characters.db")
     c = conn.cursor()
     c.execute("DELETE FROM user_personas WHERE id = ? AND user_id = ?", (persona_id, user_id))
-    # Если удаленная персона была активной, сбрасываем у юзера
     c.execute("UPDATE users SET active_persona_id = NULL WHERE user_id = ? AND active_persona_id = ?", (user_id, persona_id))
     conn.commit()
     conn.close()
@@ -506,37 +602,71 @@ async def delete_persona_callback(callback: types.CallbackQuery):
     await callback.answer()
 
 
-@dp.message(F.text == "➕ Создать персону")
-async def start_create_persona(message: types.Message, state: FSMContext):
-    await state.set_state(CreatePersona.name)
-    await message.answer("✏️ **Шаг 1 из 2:** Введите имя или название для вашей персоны (например, `Детектив Джон`):", parse_mode="Markdown")
+# --- СОЗДАНИЕ ПЕРСОНАЖА ИИ (С ПОДДЕРЖКОЙ ЗАГРУЗКИ ФОТО ФАЙЛОМ) ---
+@dp.message(F.text == "➕ Создать персонажа")
+async def start_create_char(message: types.Message, state: FSMContext):
+    await state.set_state(CreateChar.name)
+    await message.answer("✏️ **Шаг 1 из 4:** Введите имя персонажа:", parse_mode="Markdown")
 
 
-@dp.message(CreatePersona.name)
-async def process_persona_name(message: types.Message, state: FSMContext):
+@dp.message(CreateChar.name)
+async def process_char_name(message: types.Message, state: FSMContext):
     await state.update_data(name=message.text.strip())
-    await state.set_state(CreatePersona.text)
-    await message.answer("🧠 **Шаг 2 из 2:** Опишите вашу персону (возраст, внешность, характер или предысторию):", parse_mode="Markdown")
+    await state.set_state(CreateChar.prompt)
+    await message.answer("🧠 **Шаг 2 из 4:** Опишите характер и предысторию персонажа:", parse_mode="Markdown")
 
 
-@dp.message(CreatePersona.text)
-async def process_persona_text(message: types.Message, state: FSMContext):
+@dp.message(CreateChar.prompt)
+async def process_char_prompt(message: types.Message, state: FSMContext):
+    await state.update_data(prompt=message.text.strip())
+    await state.set_state(CreateChar.greeting)
+    await message.answer("💬 **Шаг 3 из 4:** Напишите приветствие персонажа:", parse_mode="Markdown")
+
+
+@dp.message(CreateChar.greeting)
+async def process_char_greeting(message: types.Message, state: FSMContext):
+    await state.update_data(greeting=message.text.strip())
+    await state.set_state(CreateChar.avatar)
+    await message.answer("🖼 **Шаг 4 из 4:** Отправьте картинку-аватарку для персонажа **напрямую файлом** (или отправьте `-`, если без картинки):", parse_mode="Markdown")
+
+
+@dp.message(CreateChar.avatar, F.photo | F.text)
+async def process_char_avatar(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    persona_name = data["name"]
-    profile_text = message.text.strip()
-    user_id = message.from_user.id
+    name = data["name"]
+    prompt = data["prompt"]
+    greeting = data["greeting"]
+    
+    avatar_url = ""
+    if message.photo:
+        avatar_url = message.photo[-1].file_id
+    elif message.text and message.text.strip() not in ["-", "нет", "no"]:
+        avatar_url = message.text.strip()
 
+    user_id = message.from_user.id
     conn = sqlite3.connect("characters.db")
     c = conn.cursor()
-    c.execute("INSERT INTO user_personas (user_id, name, profile_text) VALUES (?, ?, ?)", (user_id, persona_name, profile_text))
-    persona_id = c.lastrowid
-    c.execute("INSERT OR IGNORE INTO users (user_id, active_persona_id) VALUES (?, ?)", (user_id, persona_id))
-    c.execute("UPDATE users SET active_persona_id = ? WHERE user_id = ?", (persona_id, user_id))
+    c.execute(
+        "INSERT INTO characters (user_id, name, prompt, greeting, avatar_url) VALUES (?, ?, ?, ?, ?)",
+        (user_id, name, prompt, greeting, avatar_url)
+    )
+    char_id = c.lastrowid
     conn.commit()
     conn.close()
 
     await state.clear()
-    await message.answer(f"🎉 Персона **{persona_name}** создана и установлена как активная!", reply_markup=main_menu_kb(), parse_mode="Markdown")
+    set_active_character(user_id, char_id)
+    save_message(user_id, char_id, "assistant", greeting, delta=0)
+    footer = format_affection_footer(DEFAULT_AFFECTION, 0, "Первая встреча")
+    text = f"🎉 Персонаж **{name}** создан!\n\n{greeting}{footer}"
+
+    if avatar_url:
+        try:
+            await message.answer_photo(photo=avatar_url, caption=text, reply_markup=main_menu_kb(), parse_mode="Markdown")
+            return
+        except Exception:
+            pass
+    await message.answer(text, reply_markup=main_menu_kb(), parse_mode="Markdown")
 
 
 @dp.callback_query(F.data.startswith("selectchar_"))
@@ -607,152 +737,4 @@ async def reset_chat(message: types.Message):
     user_id = message.from_user.id
     char = get_active_character(user_id)
     if not char:
-        await message.answer("Сначала выберите персонажа!")
-        return
-    char_id, name, _, greeting, _, _ = char
-    clear_history(user_id, char_id)
-    save_message(user_id, char_id, "assistant", greeting, delta=0)
-    footer = format_affection_footer(DEFAULT_AFFECTION, 0, "С чистого листа")
-    await message.answer(f"🔄 Диалог с **{name}** сброшен!\n\n{greeting}{footer}", parse_mode="Markdown")
-
-
-@dp.message(F.text == "🗑 Удалить текущего")
-async def delete_current_char(message: types.Message):
-    user_id = message.from_user.id
-    char = get_active_character(user_id)
-    if not char:
-        await message.answer("Персонаж не выбран.")
-        return
-    char_id, name, _, _, _, owner_id = char
-    if owner_id == 0:
-        await message.answer("Стандартных персонажей удалять нельзя.")
-        return
-
-    conn = sqlite3.connect("characters.db")
-    c = conn.cursor()
-    c.execute("DELETE FROM characters WHERE id = ? AND user_id = ?", (char_id, user_id))
-    c.execute("DELETE FROM messages WHERE char_id = ? AND user_id = ?", (char_id, user_id))
-    c.execute("DELETE FROM relationships WHERE char_id = ? AND user_id = ?", (char_id, user_id))
-    c.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-    await message.answer(f"🗑 Персонаж **{name}** удален.", parse_mode="Markdown")
-
-
-# --- СОЗДАНИЕ ПЕРСОНАЖА ---
-@dp.message(F.text == "➕ Создать персонажа")
-async def start_create_char(message: types.Message, state: FSMContext):
-    await state.set_state(CreateChar.name)
-    await message.answer("✏️ **Шаг 1 из 4:** Введите имя персонажа:", parse_mode="Markdown")
-
-
-@dp.message(CreateChar.name)
-async def process_char_name(message: types.Message, state: FSMContext):
-    await state.update_data(name=message.text.strip())
-    await state.set_state(CreateChar.prompt)
-    await message.answer("🧠 **Шаг 2 из 4:** Опишите характер и предысторию персонажа:", parse_mode="Markdown")
-
-
-@dp.message(CreateChar.prompt)
-async def process_char_prompt(message: types.Message, state: FSMContext):
-    await state.update_data(prompt=message.text.strip())
-    await state.set_state(CreateChar.greeting)
-    await message.answer("💬 **Шаг 3 из 4:** Напишите приветствие персонажа:", parse_mode="Markdown")
-
-
-@dp.message(CreateChar.greeting)
-async def process_char_greeting(message: types.Message, state: FSMContext):
-    await state.update_data(greeting=message.text.strip())
-    await state.set_state(CreateChar.avatar_url)
-    await message.answer("🖼 **Шаг 4 из 4:** Отправьте прямую ссылку на аватарку персонажа (или отправьте `-`, если без картинки):", parse_mode="Markdown")
-
-
-@dp.message(CreateChar.avatar_url)
-async def process_char_avatar(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    name = data["name"]
-    prompt = data["prompt"]
-    greeting = data["greeting"]
-    avatar_url = message.text.strip()
-    if avatar_url.lower() in ["нет", "no", "-"]:
-        avatar_url = ""
-
-    user_id = message.from_user.id
-    conn = sqlite3.connect("characters.db")
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO characters (user_id, name, prompt, greeting, avatar_url) VALUES (?, ?, ?, ?, ?)",
-        (user_id, name, prompt, greeting, avatar_url)
-    )
-    char_id = c.lastrowid
-    conn.commit()
-    conn.close()
-
-    await state.clear()
-    set_active_character(user_id, char_id)
-    save_message(user_id, char_id, "assistant", greeting, delta=0)
-    footer = format_affection_footer(DEFAULT_AFFECTION, 0, "Первая встреча")
-    text = f"🎉 Персонаж **{name}** создан!\n\n{greeting}{footer}"
-
-    if avatar_url:
-        try:
-            await message.answer_photo(photo=avatar_url, caption=text, reply_markup=main_menu_kb(), parse_mode="Markdown")
-            return
-        except Exception:
-            pass
-    await message.answer(text, reply_markup=main_menu_kb(), parse_mode="Markdown")
-
-
-# --- ОСНОВНОЙ ЧАТ ---
-@dp.message()
-async def chat_handler(message: types.Message):
-    if not message.text:
-        return
-
-    user_id = message.from_user.id
-    char = get_active_character(user_id)
-    if not char:
-        await message.answer("Сначала выберите персонажа из меню!", reply_markup=get_characters_kb(user_id))
-        return
-
-    char_id, name, prompt, _, _, _ = char
-    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
-
-    save_message(user_id, char_id, "user", message.text, delta=0)
-    current_score = get_affection(user_id, char_id)
-    history = get_chat_history(user_id, char_id)
-    user_profile = get_active_persona_text(user_id)
-
-    clean_reply, mood, delta = await generate_ai_reply(prompt, history, current_score, user_profile)
-    new_score = update_affection(user_id, char_id, delta)
-    save_message(user_id, char_id, "assistant", clean_reply, delta=delta)
-
-    full_text = f"{clean_reply}{format_affection_footer(new_score, delta, mood)}"
-    try:
-        await message.answer(full_text, reply_markup=regen_kb(), parse_mode="Markdown")
-    except Exception:
-        await message.answer(full_text, reply_markup=regen_kb())
-
-
-# --- МИНИ-СЕРВЕР ДЛЯ RENDER ---
-class SimpleHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is alive!")
-
-def run_web_server():
-    port = int(os.getenv("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), SimpleHandler)
-    server.serve_forever()
-
-
-async def main():
-    init_db()
-    print("Бот успешно запущен!")
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    threading.Thread(target=run_web_server, daemon=True).start()
-    asyncio.run(main())
+        await message.
