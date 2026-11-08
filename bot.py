@@ -1067,9 +1067,33 @@ def start_health_server():
     server.serve_forever()
 
 
+import urllib.request
+
+async def keep_alive():
+    """Пингует базу Neon и веб-сервер каждые 4 минуты, чтобы они не засыпали."""
+    url = os.getenv("RENDER_EXTERNAL_URL") or f"http://127.0.0.1:{os.getenv('PORT', 8080)}"
+    while True:
+        await asyncio.sleep(240)
+        # 1. Пинг базы данных Neon
+        try:
+            conn = DBConnection()
+            c = conn.cursor()
+            c.execute("SELECT 1")
+            conn.close()
+        except Exception as e:
+            logging.warning(f"Ошибка пинга БД: {e}")
+
+        # 2. Пинг HTTP-сервера Render
+        try:
+            await asyncio.to_thread(urllib.request.urlopen, url, timeout=10)
+        except Exception as e:
+            logging.warning(f"Ошибка пинга HTTP: {e}")
+
+
 async def main():
     init_db()
     await bot.delete_webhook(drop_pending_updates=True)
+    asyncio.create_task(keep_alive())
     logging.info("🚀 Бот запущен и готов к работе!")
     await dp.start_polling(bot)
 
