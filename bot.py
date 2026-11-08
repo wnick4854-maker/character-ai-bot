@@ -66,6 +66,8 @@ class DBConnection:
     def close(self):
         self.conn.close()
 
+import re
+
 class DBCursor:
     def __init__(self, cursor, is_pg):
         self.cursor = cursor
@@ -74,7 +76,8 @@ class DBCursor:
     def execute(self, query, params=None):
         if self.is_pg:
             query = query.replace("?", "%s")
-            query = query.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+            # Надежная замена автоинкремента независимо от переносов строк и пробелов
+            query = re.sub(r'INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT', 'SERIAL PRIMARY KEY', query, flags=re.IGNORECASE)
             if "INSERT INTO users" in query and "ON CONFLICT" not in query:
                 query += " ON CONFLICT (user_id) DO UPDATE SET active_char_id = EXCLUDED.active_char_id"
         if params is not None:
