@@ -51,13 +51,12 @@ class DBConnection:
         self.is_pg = bool(DATABASE_URL and DATABASE_URL.strip())
         if self.is_pg:
             self.conn = psycopg2.connect(DATABASE_URL.strip())
-            # Включаем autocommit, чтобы запросы выполнялись независимо и курсор не закрывался
             self.conn.autocommit = True
         else:
             self.conn = sqlite3.connect("characters.db")
 
     def cursor(self):
-        return DBCursor(self.conn.cursor(), self.is_pg)
+        return self.conn.cursor()
 
     def commit(self):
         if not self.is_pg:
@@ -98,6 +97,103 @@ class DBCursor:
 def init_db():
     conn = DBConnection()
     c = conn.cursor()
+    
+    if conn.is_pg:
+        # Чистый синтаксис PostgreSQL
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS characters (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                name TEXT,
+                prompt TEXT,
+                greeting TEXT,
+                avatar_url TEXT DEFAULT ''
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                active_char_id INTEGER,
+                active_persona_id INTEGER
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS user_personas (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                name TEXT,
+                profile_text TEXT,
+                avatar_url TEXT DEFAULT ''
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                char_id INTEGER,
+                role TEXT,
+                content TEXT,
+                delta INTEGER DEFAULT 0
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS relationships (
+                user_id BIGINT,
+                char_id INTEGER,
+                affection INTEGER DEFAULT 20,
+                PRIMARY KEY (user_id, char_id)
+            )
+        """)
+    else:
+        # Локальный SQLite
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS characters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                name TEXT,
+                prompt TEXT,
+                greeting TEXT,
+                avatar_url TEXT DEFAULT ''
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                active_char_id INTEGER,
+                active_persona_id INTEGER
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS user_personas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                name TEXT,
+                profile_text TEXT,
+                avatar_url TEXT DEFAULT ''
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                char_id INTEGER,
+                role TEXT,
+                content TEXT,
+                delta INTEGER DEFAULT 0
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS relationships (
+                user_id INTEGER,
+                char_id INTEGER,
+                affection INTEGER DEFAULT 20,
+                PRIMARY KEY (user_id, char_id)
+            )
+        """)
+
+    conn.commit()
+    conn.close()
+    print("База данных успешно инициализирована!")
     
     # Проверяем, работаем ли мы с PostgreSQL
     is_pg = conn.is_pg
