@@ -441,14 +441,13 @@ async def view_persona_callback(callback: types.CallbackQuery):
     
     caption = f"👤 **Персона: {name}**\n\n{text}"
     
-    # Всегда удаляем старое сообщение со списком кнопок
     try:
         await callback.message.delete()
     except Exception:
         pass
 
-    # Если аватарка есть (сохранен file_id или ссылка) — отправляем фото с подписью
-    if avatar:
+    # Проверяем, что аватар действительно задан и не равен пустым строкам
+    if avatar and avatar.strip() not in ["", "-", "None"]:
         try:
             await callback.message.answer_photo(photo=avatar, caption=caption, reply_markup=kb, parse_mode="Markdown")
             await callback.answer()
@@ -456,7 +455,6 @@ async def view_persona_callback(callback: types.CallbackQuery):
         except Exception:
             pass
             
-    # Иначе присылаем обычным текстом, если фото не задано
     await callback.message.answer(caption, reply_markup=kb, parse_mode="Markdown")
     await callback.answer()
 
